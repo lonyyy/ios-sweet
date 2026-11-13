@@ -367,11 +367,15 @@ void show_sweetlog(void)
 			for (unsigned t = 0; t < sizeof(tags) / sizeof(tags[0]); t++) {
 				const char *hit = find(line, tags[t]);
 				if (hit) {
-					unsigned k = 0;
-					for (; k < LEN && hit[k]; k++)
-						keep[kept % KEEP][k] = hit[k];
-					keep[kept % KEEP][k] = 0;
-					kept++;
+					/* une ligne longue occupe plusieurs rangées au lieu d'être tronquée */
+					do {
+						unsigned k = 0;
+						for (; k < LEN && hit[k]; k++)
+							keep[kept % KEEP][k] = hit[k];
+						keep[kept % KEEP][k] = 0;
+						kept++;
+						hit += k;
+					} while (*hit);
 					break;
 				}
 			}
