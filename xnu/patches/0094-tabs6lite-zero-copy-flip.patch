@@ -1,0 +1,207 @@
+diff --color -ruN a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp	2026-11-13 15:26:33
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp	2026-11-13 15:28:23
+@@ -36,6 +36,66 @@
+  */
+ #include "SweetSurface.h"
+ 
++/*
++ * Tab S6 Lite (SM7125 MDP) : zero-copy presentation. Measured on the tablet (shim test 2d) :
++ * rewriting SSPP0's SRC0_ADDR and flushing CTL0 shows another buffer at the next vsync,
++ * 60 times a second. Register offsets from the tablet's DT (mdp_phys 0xae00000, sspp-off
++ * 0x5000, ctl-off 0x2000) and Linux's DPU driver.
++ */
++extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern "C" uint32_t sweet_fb_flip_w, sweet_fb_flip_h;
++uint32_t sweet_fb_flip_w, sweet_fb_flip_h;
++#define MDP_PA          0x0ae00000ULL
++#define MDP_SIZE        0x30000
++#define SSPP0           0x5000u
++#define SSPP_SRC_SIZE   0x00
++#define SSPP_SRC_XY     0x08
++#define SSPP_OUT_SIZE   0x0c
++#define SSPP_OUT_XY     0x10
++#define SSPP_SRC0_ADDR  0x14
++#define SSPP_YSTRIDE0   0x24
++#define CTL0_FLUSH      (0x2000u + 0x18u)
++#define FLUSH_SSPP0_LM0_CTL ((1u << 0) | (1u << 6) | (1u << 17))
++static vm_offset_t sweet_mdp;
++static uint32_t sweet_splash[6];        /* SSPP0 as the boot loader left it */
++static SweetSurface *sweet_shown;       /* the surface the panel scans now, retained */
++static const uint32_t sweet_sspp_regs[6] = { SSPP_SRC0_ADDR, SSPP_YSTRIDE0, SSPP_SRC_SIZE, SSPP_SRC_XY, SSPP_OUT_SIZE, SSPP_OUT_XY };
++
++static inline uint32_t mdp_rd(uint32_t off) { return *(volatile uint32_t *)(sweet_mdp + off); }
++static inline void mdp_wr(uint32_t off, uint32_t v) { *(volatile uint32_t *)(sweet_mdp + off) = v; }
++
++static void
++mdp_flush(void)
++{
++	__asm__ volatile("dsb sy" ::: "memory");
++	mdp_wr(CTL0_FLUSH, FLUSH_SSPP0_LM0_CTL);
++	for (unsigned i = 0; i < 2000 && (mdp_rd(CTL0_FLUSH) & FLUSH_SSPP0_LM0_CTL); i++) {
++		IODelay(10);                    /* latches at the next vsync : at most ~17 ms */
++	}
++}
++
++/* Point SSPP0 at `phys` (w x h, stride bpr), centered on the panel. */
++static void
++mdp_show(uint64_t phys, uint32_t w, uint32_t h, uint32_t bpr, uint32_t pw, uint32_t ph)
++{
++	mdp_wr(SSPP0 + SSPP_SRC0_ADDR, (uint32_t)phys);
++	mdp_wr(SSPP0 + SSPP_YSTRIDE0, bpr);
++	mdp_wr(SSPP0 + SSPP_SRC_SIZE, w | h << 16);
++	mdp_wr(SSPP0 + SSPP_SRC_XY, 0);
++	mdp_wr(SSPP0 + SSPP_OUT_SIZE, w | h << 16);
++	mdp_wr(SSPP0 + SSPP_OUT_XY, ((pw - w) / 2) | ((ph - h) / 2) << 16);
++	mdp_flush();
++}
++
++static void
++mdp_restore_splash(void)
++{
++	for (unsigned i = 0; i < 6; i++) {
++		mdp_wr(SSPP0 + sweet_sspp_regs[i], sweet_splash[i]);
++	}
++	mdp_flush();
++}
++
+ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
+ 
+ #if defined(SWEET)
+@@ -200,6 +260,19 @@
+ 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+ 	setProperty("external", false);
+ 	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
++	int flip = 1;
++	PE_parse_boot_argn("sweetfb_flip", &flip, sizeof(flip));
++	sweet_mdp = flip ? ml_io_map(MDP_PA, MDP_SIZE) : 0;
++	if (sweet_mdp != 0 && mdp_rd(SSPP0 + SSPP_SRC0_ADDR) == (uint32_t)fPhys &&
++	    fLogicalW <= fWidth && fLogicalH <= fHeight) {
++		for (unsigned i = 0; i < 6; i++) {
++			sweet_splash[i] = mdp_rd(SSPP0 + sweet_sspp_regs[i]);
++		}
++		sweet_fb_flip_w = fLogicalW;
++		sweet_fb_flip_h = fLogicalH;
++	}
++	IOLog("SWEET FB: flip %s (SSPP0 addr 0x%x, presented %ux%u)\n", sweet_fb_flip_w ? "on" : "off",
++	    sweet_mdp ? mdp_rd(SSPP0 + SSPP_SRC0_ADDR) : 0, fLogicalW, fLogicalH);
+ 	registerService();
+ 	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
+ 	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH);
+@@ -225,17 +298,30 @@
+ 		client->notify(SWEET_FB_NOTIFY_VSYNC, values, 6);
+ 	}
+ 	if (fb->fPowerOff) {
+-		/* Fade out: halve every channel each vsync, then black, then idle. */
++		/* Tab S6 Lite : 36 steps of 7/8 per channel (about 0.6 s) instead of 6 halvings. */
+ 		uint32_t step = fb->fFadeStep;
+-		if (step <= 6) {
++		if (step == 0 && sweet_shown != NULL) {
++			/* the panel was showing an iOS surface : copy it once into the panel buffer, go back to it */
++			SweetSurface *s = sweet_shown;
++			uintptr_t src = s->kernelAddress();
++			uint32_t ox = (fb->fWidth - s->width) / 2, oy = (fb->fHeight - s->height) / 2;
++			for (uint32_t y = 0; src != 0 && y < s->height; y++) {
++				memcpy((void *)(fb->fPixels + (uint64_t)(oy + y) * fb->fRowBytes + (uint64_t)ox * 4),
++				    (const void *)(src + s->offset + (uint64_t)y * s->bytesPerRow), (size_t)s->width * 4);
++			}
++			mdp_restore_splash();
++			sweet_shown = NULL;
++			s->release();
++		}
++		if (step <= 36) {
+ 			fb->fFadeStep = step + 1;
+ 		}
+ 		IOLockUnlock(fb->fLock);
+-		if (step <= 6) {
++		if (step <= 36) {
+ 			for (uint32_t y = 0; y < fb->fHeight; y++) {
+ 				volatile uint32_t *row = (volatile uint32_t *)(fb->fPixels + (uint64_t)y * fb->fRowBytes);
+ 				for (uint32_t x = 0; x < fb->fWidth; x++) {
+-					row[x] = step < 6 ? (row[x] >> 1) & 0x7f7f7f7f : 0;
++					row[x] = step < 36 ? row[x] - ((row[x] >> 3) & 0x1f1f1f1f) : 0;
+ 				}
+ 			}
+ 		}
+@@ -324,6 +410,44 @@
+ 		}
+ 	}
+ 
++	if (sweet_fb_flip_w != 0) {
++		uint32_t only = 0, n = 0;
++		for (uint32_t layer = 0; layer < SWEET_FB_LAYERS; layer++) {
++			uint32_t id = get32(rec, 0x54 + 4 * layer);
++			if ((mask & (1u << layer)) && id != 0) {
++				only = id;
++				n++;
++			}
++		}
++		SweetSurface *s = n == 1 ? sweet_surface_copy(only) : NULL;
++		IOByteCount seg = 0;
++		uint64_t phys = 0;
++		if (s != NULL && s != fSurface && s->width == fLogicalW && s->height == fLogicalH &&
++		    s->bytesPerElement == 4 && s->memory != NULL) {
++			phys = s->memory->getPhysicalSegment(s->offset, &seg, kIOMemoryMapperNone);
++		}
++		if (phys != 0 && phys + (uint64_t)s->bytesPerRow * s->height <= 0x100000000ULL &&
++		    seg >= (IOByteCount)s->bytesPerRow * s->height) {
++			mdp_show(phys, s->width, s->height, s->bytesPerRow, fWidth, fHeight);
++			SweetSurface *old = sweet_shown;
++			sweet_shown = s;                /* keep it while it is scanned out */
++			if (old != NULL) {
++				old->release();
++			}
++			if ((++sweet_fb_swaps_logged & 0x3ff) == 1) {
++				IOLog("SWEET FB: flip to surface %u phys 0x%llx %ux%u bpr %u\n", only, phys, s->width,
++				    s->height, s->bytesPerRow);
++			}
++			return;
++		}
++		OSSafeReleaseNULL(s);
++		if (sweet_shown != NULL) {
++			/* back to copying : the panel buffer again */
++			mdp_restore_splash();
++			sweet_shown->release();
++			sweet_shown = NULL;
++		}
++	}
+ 	for (uint32_t layer = 0; layer < SWEET_FB_LAYERS; layer++) {
+ 		uint32_t id = get32(rec, 0x54 + 4 * layer);
+ 		const uint8_t *a = rec + 0x64 + 16 * layer;
+diff --color -ruN a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+--- a/iokit/Kernel/arm/SweetSurface.cpp	2026-11-13 15:26:33
++++ b/iokit/Kernel/arm/SweetSurface.cpp	2026-11-13 15:28:23
+@@ -27,6 +27,9 @@
+  */
+ #include "SweetSurface.h"
+ 
++/* Tab S6 Lite : presented size whose surfaces AppleCLCD flips to (0 : no flipping). */
++extern "C" uint32_t sweet_fb_flip_w, sweet_fb_flip_h;
++
+ #if defined(SWEET)
+ #include <IOKit/IOService.h>
+ #include <IOKit/IOUserClient.h>
+@@ -688,8 +691,21 @@
+ 		IOBufferMemoryDescriptor *mem = NULL;
+ 		if ((uint64_t)OSAddAtomic64(s->allocSize, (volatile SInt64 *)&sweet_surface_wired) +
+ 		    s->allocSize <= SWEET_SURFACE_WIRED_MAX) {
+-			mem = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
+-			    kIODirectionInOut | kIOMemoryKernelUserShared, s->allocSize, page_size);
++			/*
++			 * Tab S6 Lite : a surface of exactly the presented screen size is allocated
++			 * physically contiguous below 4 GiB, so that AppleCLCD can show it by pointing
++			 * the display pipe at it (SSPP SRC0_ADDR is 32-bit) instead of copying it.
++			 */
++			if (sweet_fb_flip_w != 0 && s->width == sweet_fb_flip_w && s->height == sweet_fb_flip_h &&
++			    s->bytesPerElement == 4) {
++				mem = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
++				    kIODirectionInOut | kIOMemoryKernelUserShared | kIOMemoryPhysicallyContiguous,
++				    s->allocSize, 0x00000000fffff000ULL);
++			}
++			if (mem == NULL) {
++				mem = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
++				    kIODirectionInOut | kIOMemoryKernelUserShared, s->allocSize, page_size);
++			}
+ 		}
+ 		if (mem == NULL) {
+ 			OSAddAtomic64(-(SInt64)s->allocSize, (volatile SInt64 *)&sweet_surface_wired);
