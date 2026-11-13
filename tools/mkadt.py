@@ -62,6 +62,10 @@ IDENTITIES = {
                     canvas=(1125, 1998), adt=D22AP_ADT),
     'ipad6': dict(board='J71bAP', product='iPad7,5', target='J71b', chip=0x8010, scale=2,
                   canvas=(1536, 2048), adt=os.path.join(HERE, '../research/ipsw-ipad6/j71bap.adt')),
+    # iPad 5 (A9) : iPadOS 16.7.16 a le même build 20H392 que le userland iPhone X qui démarre ;
+    # /product de DeviceTree.j71sap.im4p de cet IPSW. Même canevas que l'iPad 6.
+    'ipad5': dict(board='J71sAP', product='iPad6,11', target='J71s', chip=0x8000, scale=2,
+                  canvas=(1536, 2048), adt=os.path.join(HERE, '../research/ipsw-ipad5/j71sap.adt')),
 }
 
 
@@ -276,7 +280,7 @@ if __name__ == '__main__':
     if '--scale' in sys.argv:
         override['scale'] = int(sys.argv[sys.argv.index('--scale') + 1])
     root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv, maxmem='--maxmem' in sys.argv,
-                 ident='ipad6' if '--ipad6' in sys.argv else 'iphonex', override=override)
+                 ident=next((i for i in IDENTITIES if '--' + i in sys.argv), 'iphonex'), override=override)
     blob = adt.serialize(root)
     open(sys.argv[1], 'wb').write(blob)
     if '--dump' in sys.argv:
