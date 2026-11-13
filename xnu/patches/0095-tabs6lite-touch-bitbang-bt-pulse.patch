@@ -1,0 +1,300 @@
+diff --color -ruN a/bsd/dev/i2c_gpio.h b/bsd/dev/i2c_gpio.h
+--- a/bsd/dev/i2c_gpio.h	1970-01-01 01:00:00
++++ b/bsd/dev/i2c_gpio.h	2026-11-13 15:48:07
+@@ -0,0 +1,29 @@
++/*
++ * I2C maître logiciel sur deux GPIO (Tab S6 Lite 2022, tactile Synaptics sur GPIO 59 SDA / 60 SCL).
++ * Le moteur série SE7 est configuré « GSI seul » par le firmware : sans DMA GPI, on pilote le bus à
++ * la main. Lignes en drain ouvert : « relâcher » = entrée (le pull-up tire à 1), « tirer » = sortie à 0.
++ */
++#ifndef I2C_GPIO_H
++#define I2C_GPIO_H
++#include <stdbool.h>
++#include <stddef.h>
++#include <stdint.h>
++
++struct i2c_gpio_ops {
++	void *ctx;
++	void (*drive)(void *ctx, unsigned line, bool low);   /* line 0 = SDA, 1 = SCL */
++	bool (*sense)(void *ctx, unsigned line);             /* niveau réel de la broche */
++	void (*udelay)(void *ctx, unsigned us);
++	unsigned half_us;                                    /* demi-période : 5 µs ≈ 100 kHz */
++};
++
++/* 9 coups d'horloge puis STOP : libère un esclave resté au milieu d'un octet. 0 si le bus est libre. */
++int i2c_gpio_recover(const struct i2c_gpio_ops *o);
++/*
++ * Une transaction : écrit `nt` octets puis (si nr) lit `nr` octets après un START répété.
++ * `hold` : pas de STOP à la fin (le START suivant sera répété). 0, ou -ENXIO (pas d'ACK de l'adresse),
++ * -EIO (octet non acquitté), -ETIMEDOUT (SCL tenu bas trop longtemps), -EBUSY (bus bloqué).
++ */
++int i2c_gpio_xfer(const struct i2c_gpio_ops *o, uint8_t addr, const uint8_t *tx, size_t nt, uint8_t *rx,
++    size_t nr, bool hold);
++#endif
+diff --color -ruN a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+--- a/bsd/dev/sweet_touch.c	2026-11-13 15:48:07
++++ b/bsd/dev/sweet_touch.c	2026-11-13 15:48:07
+@@ -76,6 +76,7 @@
+ static struct {
+ 	vm_offset_t se, gcc, gpio;
+ 	bool started, dead, probing;
++	bool bitbang;   /* Tab S6 Lite: SE7 is GSI-only, I2C is bit-banged on its two pins */
+ 	int kind, irq_hint;
+ 	uint32_t irq_status, irq_last, active;
+ 	unsigned sent, got;
+@@ -297,13 +298,35 @@
+ 	return err;
+ }
+ 
++/*
++ * Tab S6 Lite: SE7 comes up GSI-only (GENI_IF_DISABLE_RO bit 0), so its FIFO is unusable without a
++ * GPI DMA driver. The two bus pins are driven as open-drain GPIOs instead (input + pull-up = released,
++ * output low = pulled).
++ */
++#define TOUCH_SDA_GPIO  59u
++#define TOUCH_SCL_GPIO  60u
++#include "tabs6lite_i2c_gpio.c"
++
++static unsigned touch_bb_pin(unsigned line) { return line ? TOUCH_SCL_GPIO : TOUCH_SDA_GPIO; }
++static void touch_bb_drive(void *ctx, unsigned line, bool low) { (void)ctx; touch_gpio(touch_bb_pin(line), 0, 3, 3, low, false); }
++static bool touch_bb_sense(void *ctx, unsigned line) { (void)ctx; return touch_rd(st.gpio, TOUCH_GPIO_IO(touch_bb_pin(line))) & 1u; }
++static void touch_bb_delay(void *ctx, unsigned us) { (void)ctx; delay((int)us); }
++static const struct i2c_gpio_ops touch_bb = { NULL, touch_bb_drive, touch_bb_sense, touch_bb_delay, 3 };
++
+ static int
+ touch_msg(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx,
+     unsigned nr, bool stretch)
+ {
+ 	st.irq_status = st.irq_last = 0;
+ 	st.sent = st.got = 0;
+-	int err = touch_msg_run(addr, tx, nt, rx, nr, stretch);
++	int err;
++	if (st.bitbang) {
++		err = -i2c_gpio_xfer(&touch_bb, addr, tx, nt, rx, nr, stretch);
++		st.sent = err ? 0 : nt;
++		st.got = err ? 0 : nr;
++	} else {
++		err = touch_msg_run(addr, tx, nt, rx, nr, stretch);
++	}
+ 	if (st.probing) {
+ 		printf("SWEET TOUCH: probe xfer addr=%#x %s len=%u stretch=%u err=%d irq=%#x seen=%#x tx=%u rx=%u status=%#x\n",
+ 		    addr, nr ? "read" : "write", nr ? nr : nt, stretch ? 1u : 0u,
+@@ -881,7 +904,12 @@
+ 	printf("SWEET TOUCH: se7 fw=%#x proto=%u status=%#x tx=%#x rx=%#x ios=%#x\n",
+ 	    fw, (fw >> 8) & 0xffu, touch_rd(st.se, SE_STATUS), tx, rx,
+ 	    touch_rd(st.se, 0x908));
+-	(void)tabs6lite_se_fifo(st.se, "se7");
++	if (touch_rd(st.se, 0x64) & 1u) {
++		/* On the tablet the log stopped at the write to the DMA block (0x2004) : not touched any more. */
++		printf("SWEET TOUCH: se7 is GSI-only; bit-banging I2C on GPIO %u/%u\n", TOUCH_SDA_GPIO, TOUCH_SCL_GPIO);
++		st.bitbang = true;
++		return true;
++	}
+ 	if (((fw >> 8) & 0xffu) != 3u || (touch_rd(st.se, 0x64) & 1u) ||
+ 	    ((tx >> 24) & 0x3fu) != 32u || ((rx >> 24) & 0x3fu) != 32u ||
+ 	    ((tx >> 16) & 0x3fu) < 2u || ((rx >> 16) & 0x3fu) < 2u) {
+@@ -968,8 +996,16 @@
+ 		goto out;
+ 	}
+ 	touch_wait(10); /* conservative rail settling; not a DT timing value */
+-	touch_gpio(59, 1, 0, 0, false, false); /* qupv3_se7_i2c SDA/SCL (atoll "qup10", mux 1), 2 mA */
+-	touch_gpio(60, 1, 0, 0, false, false);
++	if (st.bitbang) {
++		touch_bb_drive(NULL, 0, false);
++		touch_bb_drive(NULL, 1, false);
++		touch_wait(2);
++		unsigned sda = touch_bb_sense(NULL, 0), scl = touch_bb_sense(NULL, 1);
++		printf("SWEET TOUCH: bit-bang bus idle sda=%u scl=%u recover=%d\n", sda, scl, i2c_gpio_recover(&touch_bb));
++	} else {
++		touch_gpio(59, 1, 0, 0, false, false); /* qupv3_se7_i2c SDA/SCL (atoll "qup10", mux 1), 2 mA */
++		touch_gpio(60, 1, 0, 0, false, false);
++	}
+ 	/* Vendor GT9896 dev_confirm: reset low 2 ms, then high. */
+ 	touch_gpio(8, 0, 3, 3, true, false);
+ 	touch_wait(2);
+diff --color -ruN a/bsd/dev/tabs6lite_bt.c b/bsd/dev/tabs6lite_bt.c
+--- a/bsd/dev/tabs6lite_bt.c	2026-11-13 15:48:07
++++ b/bsd/dev/tabs6lite_bt.c	2026-11-13 15:48:07
+@@ -93,10 +93,23 @@
+ 		goto out;
+ 	}
+ 	u.m = (struct geni_mmio){ bt_se, bt_rd, bt_wr };
+-	if (geni_uart_init(&u, bt_rates, sizeof(bt_rates) / sizeof(bt_rates[0]), 115200)) {
++	/*
++	 * La WCN3990 n'a pas de broche d'activation : un circuit sur sa ligne RX décode un octet
++	 * « impulsion » (Linux hci_qca, qca_wcn3990_init) : 0xC0 à 2400 bauds l'éteint, puis 0xFC au
++	 * débit initial la démarre. Sans cela elle reste muette (relevé : version err=-60).
++	 */
++	static const uint8_t pulse_off = 0xc0, pulse_on = 0xfc;
++	const unsigned nrates = sizeof(bt_rates) / sizeof(bt_rates[0]);
++	if (!geni_uart_init(&u, bt_rates, nrates, 2400)) {
++		(void)geni_uart_write(&u, &pulse_off, 1);
++		touch_wait(20);
++	}
++	if (geni_uart_init(&u, bt_rates, nrates, 115200)) {
+ 		printf("SWEET BT: no exact clock for 115200\n");
+ 		goto out;
+ 	}
++	printf("SWEET BT: power pulses sent, on=%d\n", geni_uart_write(&u, &pulse_on, 1));
++	touch_wait(100);
+ 	bt.io = (struct qca_bt_io){ &u, bt_send, bt_recv };
+ 	int err = qca_bt_version(&bt);
+ 	printf("SWEET BT: WCN3990 version err=%d product=%#x rom=%#x patch=%#x soc=%#x\n", err, bt.product_id,
+diff --color -ruN a/bsd/dev/tabs6lite_i2c_gpio.c b/bsd/dev/tabs6lite_i2c_gpio.c
+--- a/bsd/dev/tabs6lite_i2c_gpio.c	1970-01-01 01:00:00
++++ b/bsd/dev/tabs6lite_i2c_gpio.c	2026-11-13 15:48:07
+@@ -0,0 +1,154 @@
++/* I2C maître logiciel : voir i2c_gpio.h. Écrit pour ce portage. */
++#include "i2c_gpio.h"
++#ifdef KERNEL
++#include <sys/errno.h>
++#else
++#include <errno.h>
++#endif
++
++#define I2C_SDA 0u
++#define I2C_SCL 1u
++
++static void i2c_half(const struct i2c_gpio_ops *o) { o->udelay(o->ctx, o->half_us); }
++
++/* Relâche I2C_SCL et attend qu'il monte (l'esclave peut l'étirer) : au plus ~25 ms. */
++static int
++i2c_scl_high(const struct i2c_gpio_ops *o)
++{
++	o->drive(o->ctx, I2C_SCL, false);
++	for (unsigned i = 0; i < 5000; i++) {
++		if (o->sense(o->ctx, I2C_SCL)) {
++			return 0;
++		}
++		o->udelay(o->ctx, 5);
++	}
++	return -ETIMEDOUT;
++}
++
++static int
++i2c_start(const struct i2c_gpio_ops *o)
++{
++	o->drive(o->ctx, I2C_SDA, false);                 /* I2C_SDA haut (START répété : depuis I2C_SCL bas) */
++	i2c_half(o);
++	int e = i2c_scl_high(o);
++	if (e) {
++		return e;
++	}
++	if (!o->sense(o->ctx, I2C_SDA)) {
++		return -EBUSY;
++	}
++	i2c_half(o);
++	o->drive(o->ctx, I2C_SDA, true);                  /* I2C_SDA descend, I2C_SCL haut : START */
++	i2c_half(o);
++	o->drive(o->ctx, I2C_SCL, true);
++	return 0;
++}
++
++static void
++i2c_stop(const struct i2c_gpio_ops *o)
++{
++	o->drive(o->ctx, I2C_SDA, true);
++	i2c_half(o);
++	(void)i2c_scl_high(o);
++	i2c_half(o);
++	o->drive(o->ctx, I2C_SDA, false);                 /* I2C_SDA monte, I2C_SCL haut : STOP */
++	i2c_half(o);
++}
++
++/* Un bit, MSB d'abord ; renvoie le niveau lu sur I2C_SDA pendant que I2C_SCL est haut. */
++static int
++i2c_bit(const struct i2c_gpio_ops *o, bool one)
++{
++	o->drive(o->ctx, I2C_SDA, !one);
++	i2c_half(o);
++	int e = i2c_scl_high(o);
++	if (e) {
++		return e;
++	}
++	int v = o->sense(o->ctx, I2C_SDA) ? 1 : 0;
++	i2c_half(o);
++	o->drive(o->ctx, I2C_SCL, true);
++	return v;
++}
++
++/* Écrit un octet ; renvoie 0 si l'esclave l'acquitte (I2C_SDA bas au 9e coup), 1 sinon. */
++static int
++i2c_put(const struct i2c_gpio_ops *o, uint8_t b)
++{
++	for (int i = 7; i >= 0; i--) {
++		int e = i2c_bit(o, (b >> i) & 1u);
++		if (e < 0) {
++			return e;
++		}
++	}
++	return i2c_bit(o, true);                          /* 0 = ACK, 1 = NACK, < 0 erreur */
++}
++
++static int
++i2c_get(const struct i2c_gpio_ops *o, uint8_t *b, bool ack)
++{
++	unsigned v = 0;
++	for (int i = 0; i < 8; i++) {
++		int e = i2c_bit(o, true);
++		if (e < 0) {
++			return e;
++		}
++		v = v << 1 | (unsigned)e;
++	}
++	*b = (uint8_t)v;
++	int e = i2c_bit(o, !ack);
++	return e < 0 ? e : 0;
++}
++
++int
++i2c_gpio_recover(const struct i2c_gpio_ops *o)
++{
++	o->drive(o->ctx, I2C_SDA, false);
++	for (unsigned i = 0; i < 9 && !o->sense(o->ctx, I2C_SDA); i++) {
++		o->drive(o->ctx, I2C_SCL, true);
++		i2c_half(o);
++		(void)i2c_scl_high(o);
++		i2c_half(o);
++	}
++	o->drive(o->ctx, I2C_SCL, true);
++	i2c_half(o);
++	i2c_stop(o);
++	return o->sense(o->ctx, I2C_SDA) && o->sense(o->ctx, I2C_SCL) ? 0 : -EBUSY;
++}
++
++static int
++i2c_phase(const struct i2c_gpio_ops *o, uint8_t addr, bool rd, const uint8_t *tx, uint8_t *rx, size_t n)
++{
++	int e = i2c_start(o);
++	if (e) {
++		return e;
++	}
++	e = i2c_put(o, (uint8_t)(addr << 1 | (rd ? 1u : 0u)));
++	if (e) {
++		return e < 0 ? e : -ENXIO;
++	}
++	for (size_t i = 0; i < n; i++) {
++		e = rd ? i2c_get(o, &rx[i], i + 1 < n) : i2c_put(o, tx[i]);
++		if (e) {
++			return e < 0 ? e : -EIO;
++		}
++	}
++	return 0;
++}
++
++int
++i2c_gpio_xfer(const struct i2c_gpio_ops *o, uint8_t addr, const uint8_t *tx, size_t nt, uint8_t *rx,
++    size_t nr, bool hold)
++{
++	int e = 0;
++	if (nt || !nr) {
++		e = i2c_phase(o, addr, false, tx, NULL, nt);
++	}
++	if (!e && nr) {
++		e = i2c_phase(o, addr, true, NULL, rx, nr);
++	}
++	if (e || !hold) {
++		i2c_stop(o);
++	}
++	return e;
++}

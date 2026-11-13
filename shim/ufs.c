@@ -347,7 +347,7 @@ void show_sweetlog(void)
 	/* Tout l'anneau, ligne par ligne : on ne garde que les lignes des pilotes de la tablette. */
 	enum { KEEP = 56, LEN = 64 };
 	static char keep[KEEP][LEN + 1], line[256];
-	static const char tags[5][12] = { "SWEET TOUCH", "SWEET SPEN", "SWEET RPMH", "SWEET BT", "panic" };
+	static const char tags[7][14] = { "SWEET TOUCH", "SWEET SPEN", "SWEET RPMH", "SWEET BT", "SWEET BATTERY", "SWEET FB: flip", "panic" };
 	unsigned kept = 0, ll = 0;
 	uint64_t from = total > ring ? total - ring : 0;
 	for (uint64_t pos = from; pos < total;) {
