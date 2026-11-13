@@ -52,9 +52,20 @@ BOOT_MANIFEST_HASH = hashlib.sha384(b'sweet boot manifest').digest()
 #   tools/remotezip.py URL DeviceTree.d22ap.im4p DIR
 #   ipsw img4 im4p extract DIR/Firmware/all_flash/DeviceTree.d22ap.im4p -o d22ap.adt
 D22AP_ADT = os.path.join(os.path.dirname(os.path.abspath(__file__)), '../research/ipsw-x/d22ap.adt')
+HERE = os.path.dirname(os.path.abspath(__file__))
+# Tab S6 Lite : identités Apple présentables. L'iPad 6 (A10, sans PAC comme le noyau) a l'Apple
+# Pencil ; son /product vient de DeviceTree.j71bap.im4p de l'IPSW iPadOS 16.6.1 (tools/im4p-extract.py).
+# iPad : canevas 1536x2048 @2x (768x1024 points), plus grand que la dalle 1200x2000 : recadré au
+# centre par le noyau (sweetfb_lw/sweetfb_lh) en attendant la mise à l'échelle par le MDP.
+IDENTITIES = {
+    'iphonex': dict(board='D22AP', product='iPhone10,3', target='D22', chip=0x8015, scale=3,
+                    canvas=(1125, 1998), adt=D22AP_ADT),
+    'ipad6': dict(board='J71bAP', product='iPad7,5', target='J71b', chip=0x8010, scale=2,
+                  canvas=(1536, 2048), adt=os.path.join(HERE, '../research/ipsw-ipad6/j71bap.adt')),
+}
 
 
-def d22ap_product(path=D22AP_ADT):
+def d22ap_product(path=D22AP_ADT):  # /product de l'appareil d'identité (D22AP ou J71bAP)
     """/product properties of the real D22AP tree, without the syscfg
     placeholders iBoot would fill in (flag bit set) and the node bookkeeping."""
     if not os.path.exists(path):
@@ -78,7 +89,8 @@ def node(name, props=(), children=()):
     return n
 
 
-def build(seed=None, qemu=False, highmem=False, maxmem=False):
+def build(seed=None, qemu=False, highmem=False, maxmem=False, ident='iphonex'):
+    idn = IDENTITIES[ident]
     """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py)."""
     phys_base, mem_size = ((MAX_PHYS_BASE, MAX_MEM_SIZE) if maxmem else
                            (HIGH_PHYS_BASE, HIGH_MEM_SIZE) if highmem else (PHYS_BASE, MEM_SIZE))
@@ -110,14 +122,14 @@ def build(seed=None, qemu=False, highmem=False, maxmem=False):
         # from /chosen, the pixel size from IOMobileFramebuffer. Scale 0 makes
         # SpringBoard's FBSDisplayMode "infxinf@0x" invalid. 1080x2400 @3x =
         # 360x800 points (like iPhone X class devices).
-        ('display-scale', u32(3)),
+        ('display-scale', u32(idn['scale'])),
         # XNU derives IOPlatformUUID (gethostuuid) from these on arm; without
         # them CFPreferences cannot use kCFPreferencesCurrentHost (no ByHost
         # files), so e.g. DataMigration never records LastSystemVersion and
         # migrates on every boot. Synthetic ECID (not the phone's); chip-id
         # of the A11 that the iPhone X userland expects.
         ('unique-chip-id', struct.pack('<Q', SWEET_ECID)),
-        ('chip-id', u32(0x8015)),
+        ('chip-id', u32(idn['chip'])),
         # Security status as on a dev-fused, undemoted board (tuple 0,0,1,1):
         # MobileGestalt reads these from /chosen, and mobileactivationd's
         # DeviceType then takes its native "Hactivation" branch (state
@@ -190,8 +202,8 @@ def build(seed=None, qemu=False, highmem=False, maxmem=False):
             ph(),
             ('device_type', cstr('display-subsystem')),
             ('compatible', cstr('sweet,display')),
-            ('canvas-width', u32(1125)),
-            ('canvas-height', u32(1998)),  # Tab S6 Lite : iPhone X en 1125x1998, centré sur 1200x2000
+            ('canvas-width', u32(idn['canvas'][0])),   # Tab S6 Lite : iPhone X 1125x1998 centré,
+            ('canvas-height', u32(idn['canvas'][1])),  # ou iPad 1536x2048 recadré sur 1200x2000
         ])])
 
     fbcon = node('sweet-fbcon', [
@@ -224,7 +236,7 @@ def build(seed=None, qemu=False, highmem=False, maxmem=False):
         ('opposed-power-vol-buttons', u32(1)),
     ])
 
-    product_props = d22ap_product()
+    product_props = d22ap_product(idn['adt'])
     product = [node('product', [ph()] + product_props)] if product_props else []
 
     # Panic log region. /pram reg = <phys size>; it sits just above the
@@ -236,10 +248,10 @@ def build(seed=None, qemu=False, highmem=False, maxmem=False):
     # (iPhone10,3). 'xiaomi,sweet' stays for SweetPlatformExpert matching.
     return node('device-tree', [
         ph(),
-        ('compatible', cstr('D22AP') + cstr('iPhone10,3') + cstr('xiaomi,sweet') + cstr('qcom,sm7150') + cstr('AppleARM')),
-        ('model', cstr('iPhone10,3')),
-        ('target-type', cstr('D22')),
-        ('target-sub-type', cstr('D22AP')),
+        ('compatible', cstr(idn['board']) + cstr(idn['product']) + cstr('xiaomi,sweet') + cstr('qcom,sm7150') + cstr('AppleARM')),
+        ('model', cstr(idn['product'])),
+        ('target-type', cstr(idn['target'])),
+        ('target-sub-type', cstr(idn['board'])),
         ('manufacturer', cstr('Apple Inc.')),
         ('#address-cells', u32(2)),
         ('#size-cells', u32(2)),
@@ -247,7 +259,8 @@ def build(seed=None, qemu=False, highmem=False, maxmem=False):
 
 
 if __name__ == '__main__':
-    root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv, maxmem='--maxmem' in sys.argv)
+    root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv, maxmem='--maxmem' in sys.argv,
+                 ident='ipad6' if '--ipad6' in sys.argv else 'iphonex')
     blob = adt.serialize(root)
     open(sys.argv[1], 'wb').write(blob)
     if '--dump' in sys.argv:

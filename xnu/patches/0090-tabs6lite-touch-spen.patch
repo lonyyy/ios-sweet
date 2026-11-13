@@ -1,0 +1,494 @@
+--- a/bsd/dev/sweet_touch.c	2026-11-13 13:28:20
++++ b/bsd/dev/sweet_touch.c	2026-11-13 13:35:51
+@@ -25,13 +25,15 @@
+ #define TOUCH_SE_PA      0x00a84000u
+ #define TOUCH_GCC_PA     0x00100000u
+ #define TOUCH_NORTH_PA   0x03900000u /* DT TLMM + NORTH (0x500000) */
+-#define TOUCH_GCC_VOTE   0x5200cu
++#define TOUCH_GCC_VOTE   0x52008u    /* Tab S6 Lite (atoll): GCC APCS vote, bits 18-23 as on sweet */
+ #define TOUCH_RCG       0x18148u    /* wrapper1 LOCAL S1 = global SE7 */
+ #define TOUCH_GPIO_CFG(n) ((uint32_t)(n) * 0x1000u)
+ #define TOUCH_GPIO_IO(n)  (TOUCH_GPIO_CFG(n) + 4u)
+ #define TOUCH_MAX        10u
+ #define TOUCH_GOODIX     1
+ #define TOUCH_FTS        2
++#define TOUCH_SYNA       3
++#define SPEN_SLOT        (TOUCH_MAX - 1u) /* last contact slot: the S Pen */
+ /* GT9896 is Yellowstone in Xiaomi sweet-r-oss, not the Berlin protocol. */
+ #define GOODIX_PID_REG   0x4022u
+ #define GOODIX_EVENT_REG 0x4180u
+@@ -317,7 +319,7 @@
+ 	return touch_msg(addr, NULL, 0, buf, len, false);
+ }
+ 
+-static int
++__attribute__((unused)) static int
+ touch_goodix_ack(void)
+ {
+ 	const uint8_t ack[3] = {GOODIX_EVENT_REG >> 8, GOODIX_EVENT_REG & 0xffu, 0};
+@@ -327,7 +329,7 @@
+ /* Raw read only: 0x8240 is the vendor's generic/older VERSION candidate,
+  * not a second accepted GT9896 identity. Never try a four-byte Berlin pointer:
+  * on this 16-bit IC the extra bytes would be register data writes. */
+-static int
++__attribute__((unused)) static int
+ touch_probe_info(uint16_t reg, uint8_t *buf)
+ {
+ 	memset(buf, 0xa5, 32);
+@@ -383,7 +385,7 @@
+ 	st.active = mask;
+ }
+ 
+-static int
++__attribute__((unused)) static int
+ touch_goodix(void)
+ {
+ 	uint8_t buf[90];
+@@ -440,7 +442,7 @@
+ 	return err;
+ }
+ 
+-static int
++__attribute__((unused)) static int
+ touch_focaltech(void)
+ {
+ 	uint8_t buf[63];
+@@ -485,9 +487,366 @@
+ 	}
+ 	touch_report(mask, x, y);
+ 	return 0;
++}
++
++/*
++ * ---- Synaptics TCM: Galaxy Tab S6 Lite 2022 (SM-P613), synaptics,tcm-i2c at 0x20 on SE7 ----
++ * Written for this port from the protocol as the tablet's own Linux driver uses it:
++ *   read     {0xa5, code, length LE16}, then `length` payload bytes and one 0x5a padding byte
++ *            in "continued reads", each of which starts again with {0xa5, 0x03};
++ *   command  {opcode, length LE16, payload}: the ones used here carry no payload (3 bytes,
++ *            the most touch_msg writes);
++ *   codes    0x01 OK, 0x02 busy, 0x10 identify report, 0x11 touch report.
++ * A touch report has no fixed layout: the firmware describes it (command 0x25) as a small
++ * program of field codes and bit widths, run here by syna_parse() over the report's bits.
++ */
++#define SYNA_ADDR          0x20u
++#define SYNA_MARKER        0xa5u
++#define SYNA_CONTINUED     0x03u
++#define SYNA_OK            0x01u
++#define SYNA_BUSY          0x02u
++#define SYNA_REPORT_ID     0x10u
++#define SYNA_REPORT_TOUCH  0x11u
++#define SYNA_CMD_APP_INFO  0x20u
++#define SYNA_CMD_TOUCH_CFG 0x25u
++#define SYNA_CHUNK         88u     /* touch_msg reads at most 90 bytes: 2 for the prefix */
++#define SYNA_MAX           256u
++/* report program: codes without a width byte */
++#define SYNA_F_END         0u
++#define SYNA_F_EACH_ACTIVE 1u
++#define SYNA_F_EACH        2u
++#define SYNA_F_EACH_END    3u
++#define SYNA_F_PAD         4u
++/* codes with a width byte that this driver uses */
++#define SYNA_F_INDEX       6u
++#define SYNA_F_CLASS       7u
++#define SYNA_F_X           8u
++#define SYNA_F_Y           9u
++#define SYNA_F_ACTIVE      24u
++
++static struct {
++	uint8_t cfg[SYNA_MAX], buf[SYNA_MAX];
++	unsigned cfg_len, max_x, max_y, max_objects;
++} syna;
++
++static unsigned
++syna_le16(const uint8_t *p)
++{
++	return (unsigned)p[0] | ((unsigned)p[1] << 8);
++}
++
++/* One message into syna.buf. EAGAIN: nothing pending (no marker). */
++static int
++syna_read(uint8_t *code, unsigned *len)
++{
++	uint8_t hdr[4], part[SYNA_CHUNK + 2];
++	int err = touch_msg(SYNA_ADDR, NULL, 0, hdr, sizeof(hdr), false);
++	*len = 0;
++	if (err) {
++		return err;
++	}
++	if (hdr[0] != SYNA_MARKER) {
++		return EAGAIN;
++	}
++	*code = hdr[1];
++	unsigned total = syna_le16(hdr + 2), left = total + 1u, got = 0;
++	while (left > 1u) {             /* a last lone byte is the padding: nothing to read */
++		unsigned n = left > SYNA_CHUNK ? SYNA_CHUNK : left;
++		err = touch_msg(SYNA_ADDR, NULL, 0, part, n + 2u, false);
++		if (err) {
++			return err;
++		}
++		if (part[0] != SYNA_MARKER || part[1] != SYNA_CONTINUED) {
++			return EIO;
++		}
++		for (unsigned i = 0; i < n; ++i, ++got) {
++			if (got < total && got < SYNA_MAX) {
++				syna.buf[got] = part[2u + i];
++			}
++		}
++		left -= n;
++	}
++	*len = total < SYNA_MAX ? total : SYNA_MAX;
++	return 0;
++}
++
++/* A command without payload; skips reports until its status arrives. */
++static int
++syna_command(uint8_t op, unsigned *len)
++{
++	const uint8_t tx[3] = {op, 0, 0};
++	int err = touch_msg(SYNA_ADDR, tx, sizeof(tx), NULL, 0, false);
++	if (err) {
++		return err;
++	}
++	for (unsigned tries = 0; tries < 200; ++tries) {
++		uint8_t code = 0;
++		touch_wait(5);
++		err = syna_read(&code, len);
++		if (err == EAGAIN || (!err && (code == 0 || code == SYNA_BUSY || code >= SYNA_REPORT_ID))) {
++			continue;               /* idle, busy, or a report that is not our answer */
++		}
++		if (err) {
++			return err;
++		}
++		return code == SYNA_OK ? 0 : EIO;
++	}
++	return ETIMEDOUT;
+ }
+ 
++/* `bits` bits (at most 32) from bit `off`, least significant bit first, as the firmware packs them. */
++static unsigned
++syna_bits(unsigned len, unsigned off, unsigned bits)
++{
++	unsigned v = 0;
++	for (unsigned i = 0; i < bits && i < 32u; ++i) {
++		unsigned b = off + i;
++		if (b / 8u >= len) {
++			break;
++		}
++		v |= (unsigned)((syna.buf[b / 8u] >> (b % 8u)) & 1u) << i;
++	}
++	return v;
++}
++
++/* Index just past the EACH_END that closes the loop starting at `idx`. */
++static unsigned
++syna_skip_loop(unsigned idx)
++{
++	while (idx < syna.cfg_len) {
++		unsigned c = syna.cfg[idx++];
++		if (c == SYNA_F_EACH_END) {
++			break;
++		}
++		if (c > SYNA_F_PAD) {
++			idx++;                  /* its width byte */
++		}
++	}
++	return idx;
++}
++
++/* Run the report program over a touch report of `len` bytes into per-object fields. */
++static void
++syna_parse(unsigned len, unsigned *status, unsigned *ox, unsigned *oy)
++{
++	unsigned idx = 0, off = 0, obj = 0, next = 0, objects = 0, active = 0, steps = 0;
++	bool active_only = false, have_active = false;
++	const unsigned report_bits = len * 8u;
++	while (idx < syna.cfg_len && ++steps < 4096u && off <= report_bits) {
++		unsigned c = syna.cfg[idx++];
++		switch (c) {
++		case SYNA_F_END:
++			return;
++		case SYNA_F_EACH_ACTIVE:
++		case SYNA_F_EACH:
++			obj = objects = 0;
++			next = idx;
++			active_only = c == SYNA_F_EACH_ACTIVE;
++			if (active_only && have_active && active == 0) {
++				idx = syna_skip_loop(idx);  /* no contact: the loop has no data */
++			}
++			break;
++		case SYNA_F_EACH_END:
++			if (active_only) {
++				if (have_active ? ++objects < active : off < report_bits) {
++					idx = next;
++				}
++			} else if (++obj < syna.max_objects && obj < TOUCH_MAX) {
++				idx = next;
++			}
++			break;
++		case SYNA_F_PAD:
++			off = (off + 7u) & ~7u;
++			break;
++		default: {
++			if (idx >= syna.cfg_len) {
++				return;
++			}
++			unsigned bits = syna.cfg[idx++];
++			unsigned v = syna_bits(len, off, bits);
++			off += bits;
++			if (c == SYNA_F_INDEX) {
++				obj = v;
++			} else if (c == SYNA_F_ACTIVE) {
++				active = v;
++				have_active = true;
++			} else if (obj < TOUCH_MAX) {
++				if (c == SYNA_F_CLASS) {
++					status[obj] = v;
++				} else if (c == SYNA_F_X) {
++					ox[obj] = v;
++				} else if (c == SYNA_F_Y) {
++					oy[obj] = v;
++				}
++			}
++			break;
++		}
++		}
++	}
++}
++
++static int
++touch_synaptics(void)
++{
++	uint8_t code = 0;
++	unsigned len = 0;
++	int err = syna_read(&code, &len);
++	if (err == EAGAIN) {
++		return 0;                       /* nothing pending: keep the contacts */
++	}
++	if (err || code != SYNA_REPORT_TOUCH) {
++		return err;
++	}
++	unsigned status[TOUCH_MAX] = {0}, ox[TOUCH_MAX] = {0}, oy[TOUCH_MAX] = {0};
++	syna_parse(len, status, ox, oy);
++	int x[TOUCH_MAX] = {0}, y[TOUCH_MAX] = {0};
++	uint32_t mask = 0;
++	for (unsigned i = 0; i < SPEN_SLOT; ++i) {      /* the last slot is the S Pen's */
++		if (!status[i]) {
++			continue;               /* 0: no object (lifted) */
++		}
++		mask |= 1u << i;
++		/* sensor coordinates -> the 1200x2000 panel */
++		x[i] = (int)(syna.max_x ? ox[i] * 1199u / syna.max_x : ox[i]);
++		y[i] = (int)(syna.max_y ? oy[i] * 1999u / syna.max_y : oy[i]);
++		x[i] = x[i] > 1199 ? 1199 : x[i];
++		y[i] = y[i] > 1999 ? 1999 : y[i];
++	}
++	touch_report(mask, x, y);
++	return 0;
++}
++
++/* After reset: the identify report, then the sensor size and the report program. */
+ static bool
++syna_start(void)
++{
++	uint8_t code = 0;
++	unsigned len = 0;
++	int err = EAGAIN;
++	for (unsigned i = 0; i < 100 && (err == EAGAIN || code != SYNA_REPORT_ID); ++i) {
++		err = syna_read(&code, &len);
++		if (err && err != EAGAIN) {
++			break;
++		}
++		touch_wait(10);
++	}
++	printf("SWEET TOUCH: synaptics 0x20 identify err=%d code=%#x len=%u mode=%#x\n",
++	    err, code, len, len ? syna.buf[1] : 0);
++	if (err && err != EAGAIN) {
++		return false;
++	}
++	if (syna_command(SYNA_CMD_APP_INFO, &len) || len < 38u) {
++		printf("SWEET TOUCH: synaptics app info failed (len=%u)\n", len);
++		return false;
++	}
++	syna.max_x = syna_le16(syna.buf + 32);
++	syna.max_y = syna_le16(syna.buf + 34);
++	syna.max_objects = syna_le16(syna.buf + 36);
++	if (syna_command(SYNA_CMD_TOUCH_CFG, &len) || !len) {
++		printf("SWEET TOUCH: synaptics report config failed (len=%u)\n", len);
++		return false;
++	}
++	for (unsigned i = 0; i < len; ++i) {
++		syna.cfg[i] = syna.buf[i];
++	}
++	syna.cfg_len = len;
++	printf("SWEET TOUCH: synaptics max=%ux%u objects=%u report-config=%u bytes\n",
++	    syna.max_x, syna.max_y, syna.max_objects, syna.cfg_len);
++	return syna.max_objects != 0;
++}
++
++/*
++ * ---- S Pen: Wacom W90xx (wacom,w90xx at 0x56, same SE7 bus, same L7C rail) ----
++ * From the tablet's Linux driver (facts only): a coordinate packet is 17 bytes read as-is;
++ * byte 0 = type (low nibble, 1 = coordinates) | 0x80 in range | 0x10 tip down | 0x20 side
++ * button | 0x40 eraser; x and y big-endian at 1 and 3; pressure 12 bits at 5-6; tilt x/y
++ * signed at 8 and 9. Command 0x2a answers 32 bytes whose second half holds the maxima
++ * (x 1-2, y 3-4, pressure 5-6, big-endian). The DT orients it: wacom,invert = <0 1 1>
++ * (y inverted, then x and y swapped). Until the iPad identity takes it as an Apple Pencil,
++ * the pen is presented to iOS as one more finger, the last contact slot.
++ */
++#define SPEN_ADDR       0x56u
++#define SPEN_IRQ_GPIO   66u        /* wacom,irq-gpio = <tlmm 0x42> */
++#define SPEN_PACKET     17u
++#define SPEN_QUERY      0x2au
++
++struct spen_info {
++	unsigned max_x, max_y, max_pressure;
++	bool x_invert, y_invert, xy_switch;
++};
++static struct spen_info spen = {0, 0, 0, false, true, true};
++static bool spen_down;
++
++/* One packet -> panel position and pressure. Returns 1 tip down, 0 up, -1 not a coordinate. */
++static int
++spen_decode(const uint8_t *d, const struct spen_info *in, int *x, int *y, unsigned *pressure)
++{
++	if ((d[0] & 0x0fu) != 1u || !in->max_x || !in->max_y) {
++		return -1;
++	}
++	unsigned px = ((unsigned)d[1] << 8) | d[2], py = ((unsigned)d[3] << 8) | d[4];
++	unsigned mx = in->max_x, my = in->max_y;
++	px = px > mx ? mx : px;
++	py = py > my ? my : py;
++	if (in->x_invert) {
++		px = mx - px;
++	}
++	if (in->y_invert) {
++		py = my - py;
++	}
++	if (in->xy_switch) {
++		unsigned t = px; px = py; py = t;
++		t = mx; mx = my; my = t;
++	}
++	*x = (int)(px * 1199u / mx);
++	*y = (int)(py * 1999u / my);
++	*pressure = (((unsigned)d[5] & 0x0fu) << 8) | d[6];
++	return (d[0] & 0x80u) && (d[0] & 0x10u) ? 1 : 0;
++}
++
++static bool
++spen_start(void)
++{
++	const uint8_t q = SPEN_QUERY;
++	uint8_t a[32];
++	int err = touch_msg(SPEN_ADDR, &q, 1, NULL, 0, false);
++	touch_wait(10);
++	if (!err) {
++		err = touch_msg(SPEN_ADDR, NULL, 0, a, sizeof(a), false);
++	}
++	if (!err) {
++		spen.max_x = ((unsigned)a[17] << 8) | a[18];
++		spen.max_y = ((unsigned)a[19] << 8) | a[20];
++		spen.max_pressure = ((unsigned)a[21] << 8) | a[22];
++	}
++	printf("SWEET SPEN: query err=%d max=%ux%u pressure=%u fw=%02x%02x\n",
++	    err, spen.max_x, spen.max_y, spen.max_pressure, err ? 0 : a[23], err ? 0 : a[24]);
++	return !err && spen.max_x && spen.max_y;
++}
++
++static void
++spen_poll(void)
++{
++	if (touch_rd(st.gpio, TOUCH_GPIO_IO(SPEN_IRQ_GPIO)) & 1u) {
++		return;                 /* interrupt line high: nothing new (active low) */
++	}
++	uint8_t d[SPEN_PACKET];
++	int x, y;
++	unsigned pressure;
++	if (touch_msg(SPEN_ADDR, NULL, 0, d, sizeof(d), false)) {
++		return;
++	}
++	int down = spen_decode(d, &spen, &x, &y, &pressure);
++	if (down < 0) {
++		return;
++	}
++	if (down || spen_down) {
++		sweet_hid_touch((int)SPEN_SLOT, down, x, y);
++	}
++	spen_down = down == 1;
++}
++
++static bool
+ touch_se_init(void)
+ {
+ 	uint32_t fw = touch_rd(st.se, SE_FW);
+@@ -569,53 +928,45 @@
+ 	if (!touch_clocks() || !touch_se_init()) {
+ 		goto out;
+ 	}
+-	printf("SWEET TOUCH: TLMM reset=%#x irq=%#x vdd90=%#x; voting L11C through RPMh\n",
+-	    touch_rd(st.gpio, TOUCH_GPIO_IO(8)), touch_rd(st.gpio, TOUCH_GPIO_IO(9)),
+-	    touch_rd(st.gpio, TOUCH_GPIO_IO(90)));
++	printf("SWEET TOUCH: TLMM reset=%#x irq=%#x; voting L7C (avdd, shared with the S Pen) through RPMh\n",
++	    touch_rd(st.gpio, TOUCH_GPIO_IO(8)), touch_rd(st.gpio, TOUCH_GPIO_IO(9)));
+ 	/* Keep the IC in reset while its rails settle; IRQ stays an input. */
+ 	touch_gpio(9, 0, 3, 3, false, false); /* IRQ input, 8 mA, pull-up */
+ 	touch_gpio(8, 0, 3, 3, true, false);
+-	int power_error = sweet_rpmh_vreg_enable("ldoc11", 3200);
++	/* DT: avdd = pm6150l L7C "wacom_avdd" 3.3 V; vdd = pm6150 L10A 1.8 V, left on by the boot loader. */
++	int power_error = sweet_rpmh_vreg_enable("ldoc7", 3300);
+ 	if (power_error) {
+-		printf("SWEET TOUCH: L11C RPMh enable failed %d; probes skipped\n", power_error);
++		printf("SWEET TOUCH: L7C RPMh enable failed %d; probes skipped\n", power_error);
+ 		goto out;
+ 	}
+-	touch_gpio(90, 0, 0, 0, true, true); /* board digital power enable */
+ 	touch_wait(10); /* conservative rail settling; not a DT timing value */
+-	touch_gpio(6, 1, 0, 0, false, false); /* qup11 SDA/SCL, 2 mA */
+-	touch_gpio(7, 1, 0, 0, false, false);
++	touch_gpio(59, 1, 0, 0, false, false); /* qupv3_se7_i2c SDA/SCL (atoll "qup10", mux 1), 2 mA */
++	touch_gpio(60, 1, 0, 0, false, false);
+ 	/* Vendor GT9896 dev_confirm: reset low 2 ms, then high. */
+ 	touch_gpio(8, 0, 3, 3, true, false);
+ 	touch_wait(2);
+ 	touch_gpio(8, 0, 3, 3, true, true);
+ 	touch_wait(300); /* exceeds vendor 5 ms test + 95 ms post-test wait */
+-	uint8_t gid[32], legacy[32], fid1 = 0, fid2 = 0;
+ 	st.probing = true;
+-	int ge = touch_probe_info(GOODIX_PID_REG, gid);
+-	printf("SWEET TOUCH: probe 0x5d err=%d pid=%02x%02x%02x%02x fw=%02x.%02x.%02x.%02x irq=%#x\n",
+-	    ge, gid[0], gid[1], gid[2], gid[3], gid[8], gid[9], gid[10], gid[11], st.irq_status);
+-	(void)touch_probe_info(0x8240, legacy);
+-	int fe1 = touch_read(0x38, 0xa3, false, &fid1, 1);
+-	int fe2 = touch_read(0x38, 0x9f, false, &fid2, 1);
+-	printf("SWEET TOUCH: probe 0x38 err=%d/%d chip-id=%02x:%02x irq=%#x\n",
+-	    fe1, fe2, fid1, fid2, st.irq_status);
++	bool syna_ok = syna_start();
+ 	st.probing = false;
+-	bool goodix = !ge && gid[0] == '9' && gid[1] == '8' && gid[2] == '9' && gid[3] == '6';
+-	bool fts = !fe1 && !fe2 && fid1 == 0x54 && fid2 == 0x52;
+-	if (st.dead || goodix == fts) {
+-		printf("SWEET TOUCH: no unique supported IC (goodix=%d fts=%d dead=%d); stopping\n",
+-		    goodix, fts, st.dead);
++	if (st.dead || !syna_ok) {
++		printf("SWEET TOUCH: Synaptics TCM not started (dead=%d); stopping\n", st.dead);
+ 		goto out;
+ 	}
+-	st.kind = goodix ? TOUCH_GOODIX : TOUCH_FTS;
+-	printf("SWEET TOUCH: selected %s, 1080x2400, poll=10ms irq-hint=%d\n",
+-	    goodix ? "GT9896 Yellowstone" : "Focaltech 54:52", st.irq_hint);
++	st.kind = TOUCH_SYNA;
++	touch_gpio(SPEN_IRQ_GPIO, 0, 3, 3, false, false); /* pen IRQ input, pull-up */
++	bool spen_ok = spen_start();
++	printf("SWEET TOUCH: selected Synaptics TCM, panel 1200x2000, poll=10ms irq-hint=%d\n", st.irq_hint);
+ 	unsigned errors = 0, ticks = 0;
+ 	while (!st.dead) {
+ 		/* Optional IRQ hint still reads every 100ms, and always while down. */
+ 		if (!st.irq_hint || st.active || !(touch_rd(st.gpio, TOUCH_GPIO_IO(9)) & 1u) ||
+ 		    (++ticks % 10u) == 0) {
+-			int err = st.kind == TOUCH_GOODIX ? touch_goodix() : touch_focaltech();
++			if (spen_ok) {
++				spen_poll();
++			}
++			int err = touch_synaptics();
+ 			if (err) {
+ 				if ((errors++ % 100u) == 0) {
+ 					printf("SWEET TOUCH: report err=%d irq=%#x\n", err, st.irq_status);

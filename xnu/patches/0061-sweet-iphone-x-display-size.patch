@@ -32,12 +32,12 @@
  		IOLog("SWEET FB: no boot framebuffer\n");
  		return false;
  	}
-+	int native = 0, lh = 1998;	/* Tab S6 Lite : 1125x1998 tient dans 1200x2000 */
-+	PE_parse_boot_argn("sweetfb_native", &native, sizeof(native)); PE_parse_boot_argn("sweetfb_lh", &lh, sizeof(lh));
++	int native = 0, lh = 1998, lw = SWEET_FB_LOGICAL_W;	/* Tab S6 Lite : 1125x1998 tient dans 1200x2000 ; iPad : sweetfb_lw=1536 sweetfb_lh=2048 */
++	PE_parse_boot_argn("sweetfb_native", &native, sizeof(native)); PE_parse_boot_argn("sweetfb_lh", &lh, sizeof(lh)); PE_parse_boot_argn("sweetfb_lw", &lw, sizeof(lw));
 +	fLogicalW = fWidth;
 +	fLogicalH = fHeight;
 +	if (!native) {	/* centré, recadré si plus grand que la dalle */
-+		fLogicalW = SWEET_FB_LOGICAL_W;
++		fLogicalW = (uint32_t)lw;
 +		fLogicalH = (uint32_t)lh;
 +	}
 +	fOffX = (int32_t)(fLogicalW - fWidth) / 2;
@@ -101,9 +101,9 @@
  	if (!fLock || !IOHIDEventService::start(provider)) {
  		return false;
  	}
-+	int native = 0, lh = 1998;
-+	PE_parse_boot_argn("sweetfb_native", &native, sizeof(native)); PE_parse_boot_argn("sweetfb_lh", &lh, sizeof(lh));
-+	fLogicalW = native ? 1200 : 1125;
++	int native = 0, lh = 1998, lw = 1125;
++	PE_parse_boot_argn("sweetfb_native", &native, sizeof(native)); PE_parse_boot_argn("sweetfb_lh", &lh, sizeof(lh)); PE_parse_boot_argn("sweetfb_lw", &lw, sizeof(lw));
++	fLogicalW = native ? 1200 : lw;
 +	fLogicalH = native ? 2000 : lh;
 +	fOffX = (fLogicalW - 1200) / 2;
 +	fOffY = (fLogicalH - 2000) / 2;

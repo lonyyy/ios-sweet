@@ -37,7 +37,7 @@ attach_ro "$os" os
 attach_ro "$sysos" sysos
 attach_ro "$appos" appos
 
-hdiutil create -quiet -size "$size" -type SPARSE -fs "Case-sensitive Journaled HFS+" -volname iOSRoot "$out"
+hdiutil create -quiet -size "$size" -type SPARSE -layout NONE -fs "Case-sensitive Journaled HFS+" -volname iOSRoot "$out"   # pas de table de partitions : le volume HFS commence à l'octet 0, comme sur userdata
 mkdir "$work/root"
 hdiutil attach -quiet -nobrowse -owners on -mountpoint "$work/root" "$out.sparseimage"
 mounts=("$work/root" "${mounts[@]}")
@@ -94,7 +94,8 @@ rm -rf "$root/.fseventsd" "$root/.Spotlight-V100" "$root/.Trashes"
 df -h "$root"
 hdiutil detach -quiet "$root"
 mounts=("${mounts[@]:1}")
-dev=$(hdiutil attach -nomount -nobrowse "$out.sparseimage" | awk 'NR==1{print $1}')
+dev=$(hdiutil attach -nomount -nobrowse "$out.sparseimage" | awk '/Apple_HFS|48465300/{print $1} END{}' | head -1)
+[ -n "$dev" ] || dev=$(hdiutil attach -nomount -nobrowse "$out.sparseimage" | awk 'NR==1{print $1}')   # sans partition : le disque entier est le volume
 fsck_hfs -fy "$dev" || true
 fsck_hfs -fn "$dev"
 hdiutil detach -quiet "$dev"
