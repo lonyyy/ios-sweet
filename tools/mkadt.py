@@ -89,8 +89,8 @@ def node(name, props=(), children=()):
     return n
 
 
-def build(seed=None, qemu=False, highmem=False, maxmem=False, ident='iphonex'):
-    idn = IDENTITIES[ident]
+def build(seed=None, qemu=False, highmem=False, maxmem=False, ident='iphonex', override=None):
+    idn = dict(IDENTITIES[ident], **(override or {}))
     """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py)."""
     phys_base, mem_size = ((MAX_PHYS_BASE, MAX_MEM_SIZE) if maxmem else
                            (HIGH_PHYS_BASE, HIGH_MEM_SIZE) if highmem else (PHYS_BASE, MEM_SIZE))
@@ -237,6 +237,12 @@ def build(seed=None, qemu=False, highmem=False, maxmem=False, ident='iphonex'):
     ])
 
     product_props = d22ap_product(idn['adt'])
+    if override and 'canvas' in override and product_props:
+        # Tab S6 Lite : le type d'écran de /product doit correspondre à la taille présentée, sinon
+        # UIKit ne trouve pas de barre d'état (« rdar:45025538 ») : sous-type = hauteur en pixels
+        # (1792 pour 828x1792, comme l'iPhone XR), facteur d'échelle de l'artwork = échelle.
+        product_props = [(k, u32(override['canvas'][1]) if k == 'artwork-device-subtype' else
+                          u32(idn['scale']) if k == 'artwork-scale-factor' else v) for k, v in product_props]
     product = [node('product', [ph()] + product_props)] if product_props else []
 
     # Panic log region. /pram reg = <phys size>; it sits just above the
@@ -259,8 +265,18 @@ def build(seed=None, qemu=False, highmem=False, maxmem=False, ident='iphonex'):
 
 
 if __name__ == '__main__':
+    # Tab S6 Lite : --canvas WxH --scale N remplacent la taille présentée de l'identité. UIKit
+    # n'a de barre d'état que pour les tailles de vrais appareils (sinon « rdar:45025538 » en
+    # rouge, cf. ios-sweet NOTES 0061) : 828x1792 @2x (414x896 points, iPhone XR, comme HackiOS)
+    # tient entier dans la dalle 1200x2000 ; le noyau la présente avec sweetfb_lw=828 sweetfb_lh=1792.
+    override = {}
+    if '--canvas' in sys.argv:
+        w, h = sys.argv[sys.argv.index('--canvas') + 1].split('x')
+        override['canvas'] = (int(w), int(h))
+    if '--scale' in sys.argv:
+        override['scale'] = int(sys.argv[sys.argv.index('--scale') + 1])
     root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv, maxmem='--maxmem' in sys.argv,
-                 ident='ipad6' if '--ipad6' in sys.argv else 'iphonex')
+                 ident='ipad6' if '--ipad6' in sys.argv else 'iphonex', override=override)
     blob = adt.serialize(root)
     open(sys.argv[1], 'wb').write(blob)
     if '--dump' in sys.argv:

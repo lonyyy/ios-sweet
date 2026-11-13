@@ -56,7 +56,7 @@
 +#define KEYS_OBS_PA      0x0e600000u
 +#define KEYS_CNFG_PA     0x0c40a000u
 +#define KEYS_PON_RT      0x0810u
-+#define KEYS_GPIO_RT     0xc110u
++#define KEYS_GPIO_RT     0xc710u	/* Tab S6 Lite : vol+ = pm6150l GPIO8 (DT <&pm6150l_gpios 8>), RT_STS */
 +#define KEYS_NO_APID     0xffffu
 +
 +static vm_offset_t keys_core, keys_obs, keys_cnfg;
@@ -187,7 +187,7 @@
 +		return;
 +	}
 +	keys_pon_apid = keys_find_apid(0x008, count);
-+	keys_gpio_apid = keys_find_apid(0x4c1, count);
++	keys_gpio_apid = keys_find_apid(0x4c7, count);	/* SID 4, périphérique 0xc7 = GPIO8 */
 +	uint8_t pon = 0, gpio = 0, mode = 0, en = 0, subtype = 0;
 +	bool pok = keys_read(keys_pon_apid, KEYS_PON_RT, &pon);
 +	bool gok = keys_read(keys_gpio_apid, KEYS_GPIO_RT, &gpio);
