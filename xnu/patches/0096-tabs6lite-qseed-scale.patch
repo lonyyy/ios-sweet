@@ -1,0 +1,210 @@
+diff --color -ruN a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp	2026-11-13 15:53:09
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp	2026-11-13 15:54:15
+@@ -56,10 +56,21 @@
+ #define SSPP_YSTRIDE0   0x24
+ #define CTL0_FLUSH      (0x2000u + 0x18u)
+ #define FLUSH_SSPP0_LM0_CTL ((1u << 0) | (1u << 6) | (1u << 17))
++/* QSEED3 scaler of the VIG pipe (SSPP0 + 0xa00), as validated by shim test 2e on the tablet */
++#define QS              (SSPP0 + 0xa00u)
++#define QS_OP_MODE      0x04
++#define QS_STEP_Y_H     0x10
++#define QS_PRELOAD      0x20
++#define QS_SRC_Y        0x40
++#define QS_SRC_UV       0x44
++#define QS_DST          0x48
++#define QS_INIT_Y_H     0x90
+ static vm_offset_t sweet_mdp;
+-static uint32_t sweet_splash[6];        /* SSPP0 as the boot loader left it */
+ static SweetSurface *sweet_shown;       /* the surface the panel scans now, retained */
+-static const uint32_t sweet_sspp_regs[6] = { SSPP_SRC0_ADDR, SSPP_YSTRIDE0, SSPP_SRC_SIZE, SSPP_SRC_XY, SSPP_OUT_SIZE, SSPP_OUT_XY };
++static uint32_t sweet_panel_phys, sweet_panel_bpr;      /* the boot loader's buffer : the copy path draws there */
++/* Where the presented image is on the panel : x, y, width, height (the touch driver maps with it). */
++extern "C" int32_t sweet_fb_view[4];
++int32_t sweet_fb_view[4];
+ 
+ static inline uint32_t mdp_rd(uint32_t off) { return *(volatile uint32_t *)(sweet_mdp + off); }
+ static inline void mdp_wr(uint32_t off, uint32_t v) { *(volatile uint32_t *)(sweet_mdp + off) = v; }
+@@ -74,26 +85,39 @@
+ 	}
+ }
+ 
+-/* Point SSPP0 at `phys` (w x h, stride bpr), centered on the panel. */
++/* Scan the presented image from `phys` (stride bpr) : a flip. */
+ static void
+-mdp_show(uint64_t phys, uint32_t w, uint32_t h, uint32_t bpr, uint32_t pw, uint32_t ph)
++mdp_show(uint64_t phys, uint32_t bpr)
+ {
+ 	mdp_wr(SSPP0 + SSPP_SRC0_ADDR, (uint32_t)phys);
+ 	mdp_wr(SSPP0 + SSPP_YSTRIDE0, bpr);
+-	mdp_wr(SSPP0 + SSPP_SRC_SIZE, w | h << 16);
+-	mdp_wr(SSPP0 + SSPP_SRC_XY, 0);
+-	mdp_wr(SSPP0 + SSPP_OUT_SIZE, w | h << 16);
+-	mdp_wr(SSPP0 + SSPP_OUT_XY, ((pw - w) / 2) | ((ph - h) / 2) << 16);
+ 	mdp_flush();
+ }
+ 
++/*
++ * Once : SSPP0 reads a w x h image and shows it in sweet_fb_view, scaled by QSEED3 when the sizes
++ * differ (steps are source/destination in 21-bit fixed point, bilinear filter).
++ */
+ static void
+-mdp_restore_splash(void)
++mdp_set_view(uint32_t w, uint32_t h)
+ {
+-	for (unsigned i = 0; i < 6; i++) {
+-		mdp_wr(SSPP0 + sweet_sspp_regs[i], sweet_splash[i]);
++	uint32_t vw = (uint32_t)sweet_fb_view[2], vh = (uint32_t)sweet_fb_view[3];
++	if (vw != w || vh != h) {
++		uint32_t step_x = (uint32_t)(((uint64_t)w << 21) / vw), step_y = (uint32_t)(((uint64_t)h << 21) / vh);
++		for (unsigned i = 0; i < 4; i++) {
++			mdp_wr(QS + QS_STEP_Y_H + 4 * i, (i & 1) ? step_y : step_x);   /* Y_H, Y_V, UV_H, UV_V */
++			mdp_wr(QS + QS_INIT_Y_H + 4 * i, 0);
++		}
++		mdp_wr(QS + QS_PRELOAD, 4u | 3u << 8 | 4u << 16 | 3u << 24);
++		mdp_wr(QS + QS_SRC_Y, w | h << 16);
++		mdp_wr(QS + QS_SRC_UV, w | h << 16);
++		mdp_wr(QS + QS_DST, vw | vh << 16);
++		mdp_wr(QS + QS_OP_MODE, 1u | 3u << 16 | 1u << 14);
+ 	}
+-	mdp_flush();
++	mdp_wr(SSPP0 + SSPP_SRC_SIZE, w | h << 16);
++	mdp_wr(SSPP0 + SSPP_SRC_XY, 0);
++	mdp_wr(SSPP0 + SSPP_OUT_SIZE, vw | vh << 16);
++	mdp_wr(SSPP0 + SSPP_OUT_XY, (uint32_t)sweet_fb_view[0] | (uint32_t)sweet_fb_view[1] << 16);
+ }
+ 
+ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
+@@ -236,6 +260,10 @@
+ 	}
+ 	fOffX = (int32_t)(fLogicalW - fWidth) / 2;
+ 	fOffY = (int32_t)(fLogicalH - fHeight) / 2;
++	sweet_fb_view[0] = -fOffX;
++	sweet_fb_view[1] = -fOffY;
++	sweet_fb_view[2] = (int32_t)fLogicalW;
++	sweet_fb_view[3] = (int32_t)fLogicalH;
+ 	fLock = IOLockAlloc();
+ 	fClients = OSArray::withCapacity(4);
+ 	fSurface = sweet_surface_create_physical(fPhys, fWidth, fHeight, fRowBytes, SWEET_FB_FORMAT_BGRA);
+@@ -265,14 +293,33 @@
+ 	sweet_mdp = flip ? ml_io_map(MDP_PA, MDP_SIZE) : 0;
+ 	if (sweet_mdp != 0 && mdp_rd(SSPP0 + SSPP_SRC0_ADDR) == (uint32_t)fPhys &&
+ 	    fLogicalW <= fWidth && fLogicalH <= fHeight) {
+-		for (unsigned i = 0; i < 6; i++) {
+-			sweet_splash[i] = mdp_rd(SSPP0 + sweet_sspp_regs[i]);
++		int scale = 1;
++		PE_parse_boot_argn("sweetfb_scale", &scale, sizeof(scale));
++		if (scale) {
++			/* the largest size of the same shape that fits the panel, even, centered */
++			uint32_t vw = fWidth, vh = fHeight;
++			if ((uint64_t)fLogicalW * fHeight <= (uint64_t)fLogicalH * fWidth) {
++				vw = (uint32_t)((uint64_t)fLogicalW * fHeight / fLogicalH) & ~1u;
++			} else {
++				vh = (uint32_t)((uint64_t)fLogicalH * fWidth / fLogicalW) & ~1u;
++			}
++			sweet_fb_view[0] = (int32_t)(fWidth - vw) / 2;
++			sweet_fb_view[1] = (int32_t)(fHeight - vh) / 2;
++			sweet_fb_view[2] = (int32_t)vw;
++			sweet_fb_view[3] = (int32_t)vh;
+ 		}
++		/* the pipe reads the image from the top left of whatever buffer it scans : the copy path too */
++		fOffX = fOffY = 0;
++		sweet_panel_phys = (uint32_t)fPhys;
++		sweet_panel_bpr = fRowBytes;
++		mdp_set_view(fLogicalW, fLogicalH);
++		mdp_show(sweet_panel_phys, sweet_panel_bpr);
+ 		sweet_fb_flip_w = fLogicalW;
+ 		sweet_fb_flip_h = fLogicalH;
+ 	}
+-	IOLog("SWEET FB: flip %s (SSPP0 addr 0x%x, presented %ux%u)\n", sweet_fb_flip_w ? "on" : "off",
+-	    sweet_mdp ? mdp_rd(SSPP0 + SSPP_SRC0_ADDR) : 0, fLogicalW, fLogicalH);
++	IOLog("SWEET FB: flip %s, %ux%u shown at %d,%d %dx%d (qseed op 0x%x)\n", sweet_fb_flip_w ? "on" : "off",
++	    fLogicalW, fLogicalH, sweet_fb_view[0], sweet_fb_view[1], sweet_fb_view[2], sweet_fb_view[3],
++	    sweet_fb_flip_w ? mdp_rd(QS + QS_OP_MODE) : 0);
+ 	registerService();
+ 	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
+ 	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH);
+@@ -304,12 +351,12 @@
+ 			/* the panel was showing an iOS surface : copy it once into the panel buffer, go back to it */
+ 			SweetSurface *s = sweet_shown;
+ 			uintptr_t src = s->kernelAddress();
+-			uint32_t ox = (fb->fWidth - s->width) / 2, oy = (fb->fHeight - s->height) / 2;
++			uint32_t ox = (uint32_t)-fb->fOffX, oy = (uint32_t)-fb->fOffY;
+ 			for (uint32_t y = 0; src != 0 && y < s->height; y++) {
+ 				memcpy((void *)(fb->fPixels + (uint64_t)(oy + y) * fb->fRowBytes + (uint64_t)ox * 4),
+ 				    (const void *)(src + s->offset + (uint64_t)y * s->bytesPerRow), (size_t)s->width * 4);
+ 			}
+-			mdp_restore_splash();
++			mdp_show(sweet_panel_phys, sweet_panel_bpr);
+ 			sweet_shown = NULL;
+ 			s->release();
+ 		}
+@@ -428,7 +475,7 @@
+ 		}
+ 		if (phys != 0 && phys + (uint64_t)s->bytesPerRow * s->height <= 0x100000000ULL &&
+ 		    seg >= (IOByteCount)s->bytesPerRow * s->height) {
+-			mdp_show(phys, s->width, s->height, s->bytesPerRow, fWidth, fHeight);
++			mdp_show(phys, s->bytesPerRow);
+ 			SweetSurface *old = sweet_shown;
+ 			sweet_shown = s;                /* keep it while it is scanned out */
+ 			if (old != NULL) {
+@@ -443,7 +490,7 @@
+ 		OSSafeReleaseNULL(s);
+ 		if (sweet_shown != NULL) {
+ 			/* back to copying : the panel buffer again */
+-			mdp_restore_splash();
++			mdp_show(sweet_panel_phys, sweet_panel_bpr);
+ 			sweet_shown->release();
+ 			sweet_shown = NULL;
+ 		}
+diff --color -ruN a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp	2026-11-13 15:53:09
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp	2026-11-13 15:54:35
+@@ -6,7 +6,9 @@
+  * opens them with IOServiceOpen type 'esuc' (IOHIDEventServiceUserClient,
+  * compiled here from IOHIDFamily-1915.140.3, the version the iOS 16.7
+  * userland ships) and reads serialized IOHIDEvents from the user client's
+- * shared queue. This file has the minimal IOHIDEventService base class and
++ * shared queue. This file has the minimal IOHIDEventService base extern "C" int32_t sweet_fb_view[4];   /* SweetFramebuffer.cpp */
++
++class and
+  * two services:
+  *
+  *   SweetHIDButtons  consumer-control keys (power, volume, home)
+@@ -458,22 +460,30 @@
+ 	if (finger < 0 || finger >= SWEET_TOUCH_FINGERS) {
+ 		return;
+ 	}
+-	x = x < 0 ? 0 : (x > 1079 ? 1079 : x);
+-	y = y < 0 ? 0 : (y > 2399 ? 2399 : y);
+ 
+ 	IOLockLock(fLock);
+ 	bool was = fDown[finger];
+ 	/* Panel pixels -> the presented 1125x2436 display (SweetFramebuffer.cpp). */
+-	IOFixed nx = (IOFixed)(((int64_t)(x + fOffX) << 16) / fLogicalW);
+-	IOFixed ny = (IOFixed)(((int64_t)(y + fOffY) << 16) / fLogicalH);
++	if (sweet_fb_view[2] > 0 && sweet_fb_view[3] > 0) {
++		/* Tab S6 Lite : the image may be scaled ; AppleCLCD says where it is on the panel. */
++		fOffX = -sweet_fb_view[0];
++		fOffY = -sweet_fb_view[1];
++		fLogicalW = sweet_fb_view[2];
++		fLogicalH = sweet_fb_view[3];
++	}
++	int64_t px = x + fOffX, py = y + fOffY;
++	px = px < 0 ? 0 : (px >= fLogicalW ? fLogicalW - 1 : px);     /* a touch in the black bands : the edge */
++	py = py < 0 ? 0 : (py >= fLogicalH ? fLogicalH - 1 : py);
++	IOFixed nx = (IOFixed)((px << 16) / fLogicalW);
++	IOFixed ny = (IOFixed)((py << 16) / fLogicalH);
+ 	bool moved = down && (nx != fX[finger] || ny != fY[finger]);
+ 	if (was == down && !moved) {
+ 		IOLockUnlock(fLock);
+ 		return;
+ 	}
+ 	if (!was && down) {
+-		fEdge[finger] = x < SWEET_TOUCH_EDGE_PX || x > 1079 - SWEET_TOUCH_EDGE_PX ||
+-		    y < SWEET_TOUCH_EDGE_PX || y > 2399 - SWEET_TOUCH_EDGE_PX;
++		fEdge[finger] = px < SWEET_TOUCH_EDGE_PX || px > fLogicalW - 1 - SWEET_TOUCH_EDGE_PX ||
++		    py < SWEET_TOUCH_EDGE_PX || py > fLogicalH - 1 - SWEET_TOUCH_EDGE_PX;
+ 	}
+ 
+ 	collection = IOHIDEvent::digitizerEvent(now, 0, kIOHIDDigitizerTransducerTypeHand, false, 0, 0, 0);
