@@ -5,7 +5,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 X=aarch64-elf-
-CFLAGS="-O2 -ffreestanding -nostdlib -fno-pic -mgeneral-regs-only -mstrict-align -fno-stack-protector -Wall -Wextra"
+CFLAGS="${EXTRA_CFLAGS:-} -O2 -ffreestanding -nostdlib -fno-pic -mgeneral-regs-only -mstrict-align -fno-stack-protector -Wall -Wextra"
 SRCS="start.S shim.c console.c mmu.c fdt.c loader.c ufs.c osm.c"
 mkdir -p out
 for f in $SRCS; do ${X}gcc $CFLAGS -c $f -o out/${f%.*}.o; done

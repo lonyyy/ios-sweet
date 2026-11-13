@@ -12,6 +12,7 @@
 #include <stdint.h>
 #include "console.h"
 #include "ufs.h"
+#include <stdbool.h>
 
 #define UFS_BASE	0x01d84000UL	/* ufshc@1d84000, sweet live FDT */
 
@@ -192,23 +193,20 @@ static void list_partitions(uint32_t entry_lba, uint32_t nent)
 	}
 }
 
-void test_ufs(void)
+/*
+ * Take over the host's transfer request list, as ABL left it running, and
+ * clear a first unit attention. Shared by test_ufs() and show_sweetlog().
+ */
+static bool ufs_take(void)
 {
-	con_str("UFS", "milestone 5 probe (read-only)");
-	uint32_t cap = ufs_rd(REG_CAP), hcs = ufs_rd(REG_HCS), hce = ufs_rd(REG_HCE);
-	con_hex2("UFS", "ver=", ufs_rd(REG_VER), "cap=", cap);
-	con_hex2("UFS", "hce=", hce, "hcs=", hcs);
-	con_hex2("UFS", "is=", ufs_rd(REG_IS), "rsr=", ufs_rd(REG_UTRLRSR));
-	con_hex2("UFS", "utrlba=", ufs_rd(REG_UTRLBA), "hi=", ufs_rd(REG_UTRLBAU));
-	con_hex2("UFS", "dbr=", ufs_rd(REG_UTRLDBR), "nutrs=", (cap & 0x1f) + 1);
-
+	uint32_t hce = ufs_rd(REG_HCE), hcs = ufs_rd(REG_HCS);
 	if (!(hce & 1) || !(hcs & HCS_DP) || !(hcs & HCS_UTRLRDY)) {
 		con_str("UFS", "host not enabled/ready: stop");
-		return;
+		return false;
 	}
 	if (ufs_rd(REG_UTRLDBR)) {
 		con_str("UFS", "requests outstanding: stop");
-		return;
+		return false;
 	}
 
 	/* Take over the transfer request list: stop, point at ours, run. */
@@ -225,7 +223,7 @@ void test_ufs(void)
 	if (ufs_rd(REG_UTRLBA) != (uint32_t)list || ufs_rd(REG_UTRLBAU) != (uint32_t)(list >> 32) ||
 	    !(ufs_rd(REG_UTRLRSR) & 1)) {
 		con_str("UFS", "list base not taken: stop");
-		return;
+		return false;
 	}
 
 	uint32_t ocs = 0, st = 0, rc;
@@ -238,6 +236,23 @@ void test_ufs(void)
 			break;
 	}
 
+	return true;
+}
+
+void test_ufs(void)
+{
+	con_str("UFS", "milestone 5 probe (read-only)");
+	uint32_t cap = ufs_rd(REG_CAP), hcs = ufs_rd(REG_HCS), hce = ufs_rd(REG_HCE);
+	con_hex2("UFS", "ver=", ufs_rd(REG_VER), "cap=", cap);
+	con_hex2("UFS", "hce=", hce, "hcs=", hcs);
+	con_hex2("UFS", "is=", ufs_rd(REG_IS), "rsr=", ufs_rd(REG_UTRLRSR));
+	con_hex2("UFS", "utrlba=", ufs_rd(REG_UTRLBA), "hi=", ufs_rd(REG_UTRLBAU));
+	con_hex2("UFS", "dbr=", ufs_rd(REG_UTRLDBR), "nutrs=", (cap & 0x1f) + 1);
+
+	if (!ufs_take())
+		return;
+
+	uint32_t ocs = 0, st = 0, rc;
 	static const uint8_t cap10[10] = { 0x25 };	/* READ CAPACITY(10) */
 	rc = scsi(0, cap10, sizeof(cap10), data, 8, &ocs, &st);
 	con_hex2("UFS CAP", "rc=", rc, "ocs/st=", ocs << 8 | st);
@@ -264,3 +279,109 @@ void test_ufs(void)
 		return;
 	list_partitions(elba, nent);
 }
+
+/*
+ * Tab S6 Lite : affiche la fin du journal persistant d'ios-sweet (patch 0047),
+ * que la recovery LineageOS ne peut pas lire (adb refusé). LECTURE SEULE.
+ * Zone : les 1025 derniers blocs de userdata ; bloc 0 = en-tête
+ * "SWEETLOG" | u32 version | u32 taille de l'anneau | u64 octets écrits | u64 séquence,
+ * puis l'anneau ; l'octet n est à l'offset n % taille.
+ */
+/* Première occurrence de `w` dans `s` (pas de bibliothèque C dans le shim). */
+static const char *find(const char *s, const char *w)
+{
+	for (; *s; s++) {
+		unsigned k = 0;
+		while (w[k] && s[k] == w[k])
+			k++;
+		if (!w[k])
+			return s;
+	}
+	return 0;
+}
+
+void show_sweetlog(void)
+{
+	con_str("SWEETLOG", "journal persistant (lecture seule)");
+	if (!ufs_take())
+		return;
+	if (read_blocks(0, 2, data)) {
+		con_str("GPT", "lecture impossible");
+		return;
+	}
+	const uint8_t *gpt = data + BLOCK;
+	uint32_t nent = gpt[80] | gpt[81] << 8 | gpt[82] << 16, elba = gpt[72] | gpt[73] << 8;
+	static uint8_t ents[128 * 128] __attribute__((aligned(4096)));
+	if (nent > 128 || read_blocks(elba, (nent * 128 + BLOCK - 1) / BLOCK, ents)) {
+		con_str("GPT", "entrées illisibles");
+		return;
+	}
+	uint64_t last = 0;
+	for (uint32_t i = 0; i < nent && !last; i++) {
+		const uint8_t *e = ents + i * 128;
+		const char want[] = "userdata";
+		bool same = true;
+		for (int c = 0; c < 9 && same; c++)
+			same = e[56 + 2 * c] == (uint8_t)want[c] && e[57 + 2 * c] == 0;
+		if (same)
+			last = le64(e + 40);
+	}
+	if (!last) {
+		con_str("GPT", "pas de userdata");
+		return;
+	}
+	uint32_t hdr = (uint32_t)(last - 1024);
+	if (read_blocks(hdr, 1, data)) {
+		con_str("SWEETLOG", "en-tête illisible");
+		return;
+	}
+	if (__builtin_memcmp(data, "SWEETLOG", 8)) {
+		con_str("SWEETLOG", "absent (sweetlog=0 ou jamais écrit)");
+		return;
+	}
+	uint32_t ring = data[12] | data[13] << 8 | data[14] << 16 | (uint32_t)data[15] << 24;
+	uint64_t total = le64(data + 16);
+	con_hex2("SWEETLOG", "anneau=", ring, "ecrits=", (uint32_t)total);
+	if (!ring || ring > 1024u * BLOCK)
+		return;
+	/* Tout l'anneau, ligne par ligne : on ne garde que les lignes des pilotes de la tablette. */
+	enum { KEEP = 56, LEN = 64 };
+	static char keep[KEEP][LEN + 1], line[256];
+	static const char tags[5][12] = { "SWEET TOUCH", "SWEET SPEN", "SWEET RPMH", "SWEET BT", "panic" };
+	unsigned kept = 0, ll = 0;
+	uint64_t from = total > ring ? total - ring : 0;
+	for (uint64_t pos = from; pos < total;) {
+		uint32_t off = (uint32_t)(pos % ring), blk = off / BLOCK, in = off % BLOCK;
+		if (read_blocks(hdr + 1 + blk, 1, data))
+			return;
+		unsigned take = BLOCK - in;
+		if (take > total - pos)
+			take = (unsigned)(total - pos);
+		for (unsigned i = 0; i < take; i++) {
+			char c = (char)data[in + i];
+			if (c != '\n' && ll < sizeof(line) - 1) {
+				line[ll++] = (c >= 32 && c < 127) ? c : '.';
+				continue;
+			}
+			line[ll] = 0;
+			for (unsigned t = 0; t < sizeof(tags) / sizeof(tags[0]); t++) {
+				const char *hit = find(line, tags[t]);
+				if (hit) {
+					unsigned k = 0;
+					for (; k < LEN && hit[k]; k++)
+						keep[kept % KEEP][k] = hit[k];
+					keep[kept % KEEP][k] = 0;
+					kept++;
+					break;
+				}
+			}
+			ll = 0;
+		}
+		pos += take;
+	}
+	con_hex2("FILTRE", "lignes=", kept, "", 0);
+	con_skip();
+	for (unsigned k = kept > KEEP ? kept - KEEP : 0; k < kept; k++)
+		con_str("", keep[k % KEEP]);
+}
+

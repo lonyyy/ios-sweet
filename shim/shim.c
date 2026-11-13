@@ -389,6 +389,14 @@ void shim_main(uint64_t dtb)
 	con_skip();
 
 	/* No payload: probe the internal UFS while the MMU is still off. */
+#ifdef SHOW_SWEETLOG
+	/* Tab S6 Lite : visionneuse du journal persistant, puis on reste à l'écran. */
+	stage = "sweetlog";
+	con_clear(BLUE);
+	show_sweetlog();
+	for (;;)
+		__asm__ volatile("wfe");
+#endif
 	stage = "ufs";
 	test_ufs();
 	con_skip();
