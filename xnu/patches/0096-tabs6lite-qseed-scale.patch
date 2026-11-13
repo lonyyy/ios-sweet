@@ -159,18 +159,16 @@ diff --color -ruN a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/Swe
  		}
 diff --color -ruN a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
 --- a/iokit/Kernel/arm/hid/SweetHID.cpp	2026-11-13 15:53:09
-+++ b/iokit/Kernel/arm/hid/SweetHID.cpp	2026-11-13 15:54:35
-@@ -6,7 +6,9 @@
-  * opens them with IOServiceOpen type 'esuc' (IOHIDEventServiceUserClient,
-  * compiled here from IOHIDFamily-1915.140.3, the version the iOS 16.7
-  * userland ships) and reads serialized IOHIDEvents from the user client's
-- * shared queue. This file has the minimal IOHIDEventService base class and
-+ * shared queue. This file has the minimal IOHIDEventService base extern "C" int32_t sweet_fb_view[4];   /* SweetFramebuffer.cpp */
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp	2026-11-13 16:06:00
+@@ -22,6 +22,8 @@
+ #include <libkern/c++/OSArray.h>
+ #include <pexpert/pexpert.h>
+ 
++extern "C" int32_t sweet_fb_view[4];   /* SweetFramebuffer.cpp : where the image is on the panel */
 +
-+class and
-  * two services:
-  *
-  *   SweetHIDButtons  consumer-control keys (power, volume, home)
+ #include "IOHIDEventService.h"
+ #include "IOHIDEventServiceUserClient.h"
+ #include "IOHIDEvent.h"
 @@ -458,22 +460,30 @@
  	if (finger < 0 || finger >= SWEET_TOUCH_FINGERS) {
  		return;
