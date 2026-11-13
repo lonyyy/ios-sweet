@@ -21,8 +21,12 @@ PANIC_LOG_SIZE = 0x100000
 # --highmem (phone only): the whole upper DDR bank. The live FDT memory node is
 # <0x80000000 2G>, <0x1_00000000 0xfcc00000>; every fixed reserved-memory
 # carve-out is in the low bank and the dynamic pools are limited below 4G.
-HIGH_PHYS_BASE = 0x100000000
-HIGH_MEM_SIZE = 0xfcc00000
+HIGH_PHYS_BASE = 0x106000000  # Tab S6 Lite : après sec_debug_rdx_bootdev (0x100000000 + 0x5900000), aligné 32 Mo
+HIGH_MEM_SIZE = 0x7a000000  # jusqu à 0x180000000, fin de la RAM (iomem)
+# --maxmem (Tab S6 Lite) : tout le bloc contigu de 3 Go, zone de debug Samsung
+# (sec_debug_rdx_bootdev, inutilisée sans Android) comprise. Comme un iPhone X.
+MAX_PHYS_BASE = 0xc0000000
+MAX_MEM_SIZE = 0xc0000000
 # /arm-io children are relative to this; it must not be 0 (serial_init bails)
 SOC_BASE = 0x01000000
 
@@ -74,9 +78,10 @@ def node(name, props=(), children=()):
     return n
 
 
-def build(seed=None, qemu=False, highmem=False):
+def build(seed=None, qemu=False, highmem=False, maxmem=False):
     """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py)."""
-    phys_base, mem_size = (HIGH_PHYS_BASE, HIGH_MEM_SIZE) if highmem else (PHYS_BASE, MEM_SIZE)
+    phys_base, mem_size = ((MAX_PHYS_BASE, MAX_MEM_SIZE) if maxmem else
+                           (HIGH_PHYS_BASE, HIGH_MEM_SIZE) if highmem else (PHYS_BASE, MEM_SIZE))
     # Carve the panic log off the top so the kernel never allocates over it.
     panic_base = phys_base + mem_size - PANIC_LOG_SIZE
     mem_size -= PANIC_LOG_SIZE
@@ -186,7 +191,7 @@ def build(seed=None, qemu=False, highmem=False):
             ('device_type', cstr('display-subsystem')),
             ('compatible', cstr('sweet,display')),
             ('canvas-width', u32(1125)),
-            ('canvas-height', u32(2436)),
+            ('canvas-height', u32(1998)),  # Tab S6 Lite : iPhone X en 1125x1998, centré sur 1200x2000
         ])])
 
     fbcon = node('sweet-fbcon', [
@@ -242,7 +247,7 @@ def build(seed=None, qemu=False, highmem=False):
 
 
 if __name__ == '__main__':
-    root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv)
+    root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv, maxmem='--maxmem' in sys.argv)
     blob = adt.serialize(root)
     open(sys.argv[1], 'wb').write(blob)
     if '--dump' in sys.argv:

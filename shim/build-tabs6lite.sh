@@ -6,10 +6,10 @@ set -euo pipefail
 cd "$(dirname "$0")"
 X=aarch64-elf-
 CFLAGS="-O2 -ffreestanding -nostdlib -fno-pic -mgeneral-regs-only -mstrict-align -fno-stack-protector -Wall -Wextra"
-SRCS="start.S shim.c console.c mmu.c fdt.c loader.c ufs.c"
+SRCS="start.S shim.c console.c mmu.c fdt.c loader.c ufs.c osm.c"
 mkdir -p out
 for f in $SRCS; do ${X}gcc $CFLAGS -c $f -o out/${f%.*}.o; done
-abs=$(${X}readelf -r out/shim.o out/console.o out/mmu.o out/fdt.o out/loader.o out/ufs.o | grep -c ABS64 || true)
+abs=$(${X}readelf -r out/shim.o out/console.o out/mmu.o out/fdt.o out/loader.o out/ufs.o out/osm.o | grep -c ABS64 || true)
 [ "$abs" = 0 ] || { echo "erreur : $abs relocations absolues" >&2; exit 1; }
 objs=$(for f in $SRCS; do printf 'out/%s.o ' "${f%.*}"; done)
 ${X}gcc $CFLAGS -static -T shim.ld -Wl,--build-id=none -Wl,--no-warn-rwx-segments -Wl,-N $objs -lgcc -o out/shim.elf
