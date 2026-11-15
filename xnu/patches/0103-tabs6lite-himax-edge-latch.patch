@@ -1,0 +1,79 @@
+diff --color -ruN a/bsd/dev/tabs6lite_himax.c b/bsd/dev/tabs6lite_himax.c
+--- a/bsd/dev/tabs6lite_himax.c	2026-11-15 14:48:37
++++ b/bsd/dev/tabs6lite_himax.c	2026-11-15 14:48:37
+@@ -61,7 +61,36 @@
+ 
+ static const struct himax_io hx_io = { NULL, hx_xfer };
+ 
++/*
++ * L'IRQ du Himax est une impulsion (journal Android : HX_INT_IS_EDGE = 1) : lue au niveau toutes
++ * les 10 ms, elle restait à 1 (relevé sur la tablette). Le TLMM mémorise les fronts dans le statut
++ * d'interruption de la broche si « raw status » est mis, même sans livrer l'interruption au GIC
++ * (enable = 0) : registres de broche +0x8 (cfg) et +0xC (statut), disposition sc7180 de Linux.
++ */
++#define TLMM_INTR_CFG(n)        (TOUCH_GPIO_CFG(n) + 0x8u)
++#define TLMM_INTR_STATUS(n)     (TOUCH_GPIO_CFG(n) + 0xcu)
++#define TLMM_INTR_RAW_STATUS    (1u << 4)
++#define TLMM_INTR_FALLING       (2u << 2 | 1u << 1)     /* détection front descendant, polarité 1 */
++
+ static void
++hx_irq_latch_init(void)
++{
++	touch_wr(touch_tile(HX_IRQ), TLMM_INTR_CFG(HX_IRQ), TLMM_INTR_RAW_STATUS | TLMM_INTR_FALLING);
++	touch_wr(touch_tile(HX_IRQ), TLMM_INTR_STATUS(HX_IRQ), 0);
++}
++
++/* Un front descendant depuis le dernier appel (statut remis à zéro), ou la ligne basse. */
++static bool
++hx_irq_seen(void)
++{
++	bool edge = touch_rd(touch_tile(HX_IRQ), TLMM_INTR_STATUS(HX_IRQ)) & 1u;
++	if (edge) {
++		touch_wr(touch_tile(HX_IRQ), TLMM_INTR_STATUS(HX_IRQ), 0);
++	}
++	return edge || !touch_gpio_level(HX_IRQ);
++}
++
++static void
+ hx_pins(void)
+ {
+ 	touch_gpio(HX_CS, 0, 0, 2, true, true);
+@@ -103,24 +132,32 @@
+ 	touch_wait(20);
+ 	touch_gpio(HX_RST, 0, 0, 2, true, true);
+ 	touch_wait(150);
+-	return hx_identify("after reset");
++	bool ok = hx_identify("after reset");
++	if (ok) {
++		hx_irq_latch_init();
++	}
++	return ok;
+ }
+ 
+ /* Une trame si l'IRQ est basse ; remonte les doigts 0 à 8 (le 9e emplacement est celui du S Pen). */
+ static void
+ hx_poll(void)
+ {
+-	static unsigned logged;
++	static unsigned logged, ticks, edges;
+ 	uint8_t ev[HIMAX_EVENT_LEN];
+-	if (touch_gpio_level(HX_IRQ) || himax_read_event(&hx_io, ev)) {
++	bool irq = hx_irq_seen();
++	edges += irq;
++	/* sans front, une lecture toutes les 250 ms quand même : la pile dit si la puce balaie */
++	if ((!irq && (++ticks % 25u) != 0) || himax_read_event(&hx_io, ev)) {
+ 		return;
+ 	}
+ 	unsigned mask;
+ 	int n = himax_parse(ev, hx_pt, &mask);
+-	if (logged < 6) {
++	if (logged < 12 && (n > 0 || logged < 4)) {
+ 		logged++;
+-		printf("SWEET TOUCH: himax event n=%d mask=%#x %02x%02x%02x%02x cnt=%#x x0=%d y0=%d\n", n, mask, ev[0], ev[1],
+-		    ev[2], ev[3], ev[52], (mask & 1u) ? hx_pt[0].x : -1, (mask & 1u) ? hx_pt[0].y : -1);
++		printf("SWEET TOUCH: himax event irq=%d edges=%u n=%d mask=%#x %02x%02x%02x%02x cnt=%#x x0=%d y0=%d\n",
++		    irq, edges, n, mask, ev[0], ev[1], ev[2], ev[3], ev[52], (mask & 1u) ? hx_pt[0].x : -1,
++		    (mask & 1u) ? hx_pt[0].y : -1);
+ 	}
+ 	if (n < 0) {
+ 		mask = 0;
