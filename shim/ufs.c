@@ -349,7 +349,7 @@ void show_sweetlog(void)
 	static char keep[KEEP][LEN + 1], line[256];
 #ifdef SHOW_SWEETLOG_DIAG
 	/* variante « diagnostic » : vitesse des cœurs, statistiques d'affichage, trames tactiles */
-	static const char tags[][16] = { "SWEET CPU", "SWEET STAT", "SWEET TOUCH", "SWEET SPEN", "SWEET FB: flip", "screen-size", "SWEET USB", "panic" };
+	static const char tags[][16] = { "SWEET CPU", "SWEET STAT", "SWEET FB: flip", "flip pool", "screen-size", "SWEET USB", "CRASH ", "panic" };
 #elif defined(SHOW_SWEETLOG_SB)
 	/* variante « interface » : SpringBoard, migration de données, plantages et sorties seulement */
 	static const char tags[][16] = { "SpringBoard", "backboardd", "datamigrat", "igrationplugin", "CRASH ", "exited --", "panic" };
