@@ -1,0 +1,57 @@
+diff --color -ruN a/bsd/dev/tabs6lite_himax.c b/bsd/dev/tabs6lite_himax.c
+--- a/bsd/dev/tabs6lite_himax.c	2026-11-15 17:40:41
++++ b/bsd/dev/tabs6lite_himax.c	2026-11-15 17:40:41
+@@ -37,7 +37,9 @@
+ 		in = (uint8_t)(in << 1 | (touch_gpio_level(hx_miso) ? 1u : 0u));
+ 		hx_set(HX_CLK, false);
+ 		hx_set(hx_mosi, (out >> b) & 1u);
+-		hx_set(HX_CLK, true);   /* chaque écriture TLMM prend déjà ~0,2 µs : < 3 MHz, la puce accepte 7 MHz */
++		delay(1);               /* 0105 sans attente : tactile muet sur la tablette ; on revient au rythme validé */
++		hx_set(HX_CLK, true);
++		delay(1);
+ 	}
+ 	return in;
+ }
+diff --color -ruN a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp	2026-11-15 17:40:30
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp	2026-11-15 17:40:30
+@@ -562,36 +562,10 @@
+ 		uintptr_t src = s->kernelAddress();
+ 		uint32_t bpe = s->bytesPerElement ? s->bytesPerElement : 4;
+ 		/*
+-		 * Tab S6 Lite : a layer whose source rectangle (a) differs in size from its destination
+-		 * (b) is scaled, nearest pixel. Copied 1:1 it read past its rows (sheared stripes seen on
+-		 * the tablet) or showed only a corner.
++		 * Tab S6 Lite : layers whose source and destination sizes differ are NOT scaled here.
++		 * Scaling them (0105) stretched iOS's tiny solid-colour layers over the whole screen
++		 * (white screen on the tablet) : without alpha blending, copying 1:1 is the lesser evil.
+ 		 */
+-		int32_t aw = (int32_t)get32(a, 8), ah = (int32_t)get32(a, 12);
+-		if (src != 0 && bpe == 4 && aw > 0 && ah > 0 && w > 0 && h > 0 && (aw != w || ah != h) &&
+-		    sx >= 0 && sy >= 0 && sx + aw <= (int32_t)s->width && sy + ah <= (int32_t)s->height &&
+-		    s->elementWidth == 1 && s->elementHeight == 1 && s->memory != NULL &&
+-		    (uint64_t)s->offset + (uint64_t)(sy + ah - 1) * s->bytesPerRow + (uint64_t)(sx + aw) * 4 <=
+-		    s->memory->getLength()) {
+-			int32_t ox = dx - fOffX, oy = dy - fOffY;
+-			sweet_fb_stat[3]++;
+-			for (int32_t y = 0; y < h; y++) {
+-				int32_t py = oy + y;
+-				if (py < 0 || py >= (int32_t)fHeight) {
+-					continue;
+-				}
+-				const uint32_t *srow = (const uint32_t *)(src + s->offset +
+-				    (uint64_t)(sy + (int64_t)y * ah / h) * s->bytesPerRow) + sx;
+-				uint32_t *drow = (uint32_t *)(fPixels + (uint64_t)py * fRowBytes);
+-				for (int32_t x = 0; x < w; x++) {
+-					int32_t px = ox + x;
+-					if (px >= 0 && px < (int32_t)fWidth) {
+-						drow[px] = srow[(int64_t)x * aw / w];
+-					}
+-				}
+-			}
+-			s->release();
+-			continue;
+-		}
+ 		if (w <= 0 || h <= 0) {
+ 			w = (int32_t)s->width;
+ 			h = (int32_t)s->height;
