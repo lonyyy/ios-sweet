@@ -347,7 +347,10 @@ void show_sweetlog(void)
 	/* Tout l'anneau, ligne par ligne : on ne garde que les lignes des pilotes de la tablette. */
 	enum { KEEP = 56, LEN = 64 };
 	static char keep[KEEP][LEN + 1], line[256];
-#ifdef SHOW_SWEETLOG_FB
+#ifdef SHOW_SWEETLOG_PROC
+	/* variante « processus » : lancements, plantages et sorties (qui bloque le démarrage) */
+	static const char tags[][16] = { "exec ", "CRASH ", "exited --", "exit reason", "panic" };
+#elif defined(SHOW_SWEETLOG_FB)
 	/* variante « affichage » : création des surfaces iOS et couches présentées (taille, format, pas) */
 	static const char tags[][16] = { "SWEET SURF", "SWEET FB", "panic" };
 #else
