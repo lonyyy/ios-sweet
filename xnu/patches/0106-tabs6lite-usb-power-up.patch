@@ -1,0 +1,116 @@
+diff --color -ruN a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+--- a/bsd/dev/sweet_usb.c	2026-11-15 16:05:33
++++ b/bsd/dev/sweet_usb.c	2026-11-15 16:07:12
+@@ -73,6 +73,79 @@
+ 	return v;
+ }
+ 
++extern int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
++
++/*
++ * Tab S6 Lite : the Samsung boot loader starts the kernel with the USB block off (ios-sweet
++ * relied on `fastboot boot`, which leaves it on). Power it the way Linux does, from this
++ * tablet's DT and the sc7180 clock map (atoll has the same GCC layout) : rails, GDSC, master
++ * clock at the DT's HS rate, branch clocks, block resets, QUSB2 PHY init sequence.
++ * boot-arg sweetusbpower=0 skips it.
++ */
++#define GCC_USB30_PRIM_BCR      0x0f000
++#define GCC_QUSB2PHY_PRIM_BCR   0x26000
++#define GCC_USB30_MASTER_RCGR   0x0f01c         /* CMD ; CFG at +4 */
++#define CBCR_CLK_ENABLE         (1u << 0)
++/* DT qcom,qusb-phy-init-seq (value, offset) ; the last write (0x22 to PWR_CTRL1) powers the PHY up */
++static const uint16_t qusb2_init[][2] = {
++	{ 0x23, 0x210 }, { 0x03, 0x004 }, { 0x7c, 0x18c }, { 0x80, 0x02c }, { 0x0a, 0x184 }, { 0x19, 0x0b4 },
++	{ 0x40, 0x194 }, { 0x16, 0x198 }, { 0x21, 0x214 }, { 0x08, 0x220 }, { 0x58, 0x224 }, { 0x47, 0x240 },
++	{ 0x2b, 0x244 }, { 0xca, 0x248 }, { 0x00, 0x24c }, { 0x03, 0x250 }, { 0x30, 0x23c }, { 0x22, 0x210 },
++};
++
++static void
++usb_wr(vm_offset_t base, uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(base + off) = v;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++static void
++usb_power_up(vm_offset_t gcc)
++{
++	/* DT qusb@88e3000 : vdd L4A 0.88 V, vdda18 L11A 1.8 V, vdda33 L17A 3.075 V */
++	int e1 = sweet_rpmh_vreg_enable("ldoa4", 880), e2 = sweet_rpmh_vreg_enable("ldoa11", 1800),
++	    e3 = sweet_rpmh_vreg_enable("ldoa17", 3075);
++	usb_wr(gcc, GCC_USB30_PRIM_GDSCR, usb_rd(gcc, GCC_USB30_PRIM_GDSCR) & ~1u);      /* SW_COLLAPSE off */
++	for (int i = 0; i < 100 && !(usb_rd(gcc, GCC_USB30_PRIM_GDSCR) & (1u << 31)); i++) {
++		delay(10);
++	}
++	/* master clock : GPLL0_OUT_EVEN (300 MHz, source 6) / 4.5 = 66.67 MHz, DT qcom,core-clk-rate-hs */
++	usb_wr(gcc, GCC_USB30_MASTER_RCGR + 4, (6u << 8) | 8u);
++	usb_wr(gcc, GCC_USB30_MASTER_RCGR, usb_rd(gcc, GCC_USB30_MASTER_RCGR) | 1u);
++	for (int i = 0; i < 100 && (usb_rd(gcc, GCC_USB30_MASTER_RCGR) & 1u); i++) {
++		delay(10);
++	}
++	for (unsigned i = 0; i < sizeof(usb_cbcr) / sizeof(usb_cbcr[0]); i++) {
++		usb_wr(gcc, usb_cbcr[i].off, usb_rd(gcc, usb_cbcr[i].off) | CBCR_CLK_ENABLE);
++	}
++	delay(100);
++	/* block resets : controller and PHY, as dwc3-msm and the QUSB2 driver do at init */
++	usb_wr(gcc, GCC_USB30_PRIM_BCR, 1);
++	usb_wr(gcc, GCC_QUSB2PHY_PRIM_BCR, 1);
++	delay(1000);
++	usb_wr(gcc, GCC_QUSB2PHY_PRIM_BCR, 0);
++	usb_wr(gcc, GCC_USB30_PRIM_BCR, 0);
++	delay(1000);
++	printf("SWEET USB: power-up rails L4A=%d L11A=%d L17A=%d GDSC 0x%08x master RCGR 0x%08x/0x%08x\n", e1, e2,
++	    e3, usb_rd(gcc, GCC_USB30_PRIM_GDSCR), usb_rd(gcc, GCC_USB30_MASTER_RCGR),
++	    usb_rd(gcc, GCC_USB30_MASTER_RCGR + 4));
++	if (usb_rd(gcc, usb_cbcr[5].off) & CBCR_CLK_OFF) {
++		printf("SWEET USB: ahb2phy still off; QUSB2 left alone\n");
++		return;
++	}
++	vm_offset_t phy = ml_io_map(QUSB2_PA, QUSB2_SIZE);
++	if (phy == 0) {
++		return;
++	}
++	for (unsigned i = 0; i < sizeof(qusb2_init) / sizeof(qusb2_init[0]); i++) {
++		usb_wr(phy, qusb2_init[i][1], qusb2_init[i][0]);
++	}
++	delay(150);
++	printf("SWEET USB: QUSB2 init done, PLL_STATUS 0x%08x PWR_CTRL1 0x%08x\n", usb_rd(phy, 0x1a0),
++	    usb_rd(phy, 0x210));
++}
++
+ void
+ sweet_usb_probe(void)
+ {
+@@ -99,6 +172,19 @@
+ 	}
+ 	/* DWC3 registers need the GDSC, the master clock and the config-NoC path. */
+ 	clocks_on = (gdscr & (1u << 31)) && !(cbcr[0] & CBCR_CLK_OFF) && !(cbcr[3] & CBCR_CLK_OFF);
++	int power = 1;
++	PE_parse_boot_argn("sweetusbpower", &power, sizeof(power));
++	bool powered_here = false;
++	if (!clocks_on && power) {
++		usb_power_up(gcc);
++		gdscr = usb_rd(gcc, GCC_USB30_PRIM_GDSCR);
++		for (unsigned i = 0; i < sizeof(usb_cbcr) / sizeof(usb_cbcr[0]); i++) {
++			cbcr[i] = usb_rd(gcc, usb_cbcr[i].off);
++			printf("SWEET USB: after power-up clk %-12s CBCR 0x%08x\n", usb_cbcr[i].name, cbcr[i]);
++		}
++		clocks_on = (gdscr & (1u << 31)) && !(cbcr[0] & CBCR_CLK_OFF) && !(cbcr[3] & CBCR_CLK_OFF);
++		powered_here = clocks_on;
++	}
+ 	if (!clocks_on) {
+ 		printf("SWEET USB: controller unpowered or unclocked; DWC3 not read\n");
+ 		return;
+@@ -116,6 +202,12 @@
+ 	printf("SWEET USB: DWC3 GEVNTADR 0x%08x%08x GEVNTSIZ 0x%08x GEVNTCOUNT 0x%08x GHWPARAMS0 0x%08x\n",
+ 	    usb_rd(dwc, 0xc404), usb_rd(dwc, 0xc400), usb_rd(dwc, 0xc408), usb_rd(dwc, 0xc40c),
+ 	    usb_rd(dwc, 0xc140));
++	if (powered_here) {
++		/* what ABL's fastboot would have left : device role, no USB2 PHY suspend (DT dis_u2_susphy_quirk) */
++		usb_wr(dwc, 0xc110, (usb_rd(dwc, 0xc110) & ~(3u << 12)) | (2u << 12));  /* GCTL PRTCAPDIR = device */
++		usb_wr(dwc, 0xc200, usb_rd(dwc, 0xc200) & ~(1u << 6));                /* GUSB2PHYCFG SUSPHY off */
++		printf("SWEET USB: set up here: GCTL 0x%08x GUSB2PHYCFG 0x%08x\n", usb_rd(dwc, 0xc110), usb_rd(dwc, 0xc200));
++	}
+ 	if (enabled >= 2) {
+ 		sweet_usb_gadget_start(dwc);
+ 	}
