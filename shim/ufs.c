@@ -350,6 +350,9 @@ void show_sweetlog(void)
 #ifdef SHOW_SWEETLOG_PROC
 	/* variante « processus » : lancements, plantages et sorties (qui bloque le démarrage) */
 	static const char tags[][16] = { "exec ", "CRASH ", "exited --", "exit reason", "panic" };
+	/* relancés en boucle sans conséquence sur l'interface (relevé iPadOS) : masqués */
+	static const char skip[][16] = { "xpcproxy", "bluetoothd", "fairplayd" };
+#define SWEETLOG_SKIP 1
 #elif defined(SHOW_SWEETLOG_FB)
 	/* variante « affichage » : création des surfaces iOS et couches présentées (taille, format, pas) */
 	static const char tags[][16] = { "SWEET SURF", "SWEET FB", "panic" };
@@ -372,7 +375,14 @@ void show_sweetlog(void)
 				continue;
 			}
 			line[ll] = 0;
+#ifdef SWEETLOG_SKIP
+			bool noisy = false;
+			for (unsigned k = 0; k < sizeof(skip) / sizeof(skip[0]); k++)
+				noisy = noisy || find(line, skip[k]);
+			for (unsigned t = 0; !noisy && t < sizeof(tags) / sizeof(tags[0]); t++) {
+#else
 			for (unsigned t = 0; t < sizeof(tags) / sizeof(tags[0]); t++) {
+#endif
 				const char *hit = find(line, tags[t]);
 				if (hit) {
 					/* une ligne longue occupe plusieurs rangées au lieu d'être tronquée */
