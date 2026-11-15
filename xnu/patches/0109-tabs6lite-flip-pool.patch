@@ -1,0 +1,117 @@
+diff --color -ruN a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp	2026-11-15 18:37:33
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp	2026-11-15 18:37:58
+@@ -45,6 +45,7 @@
+ extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ extern "C" uint32_t sweet_fb_flip_w, sweet_fb_flip_h;
+ uint32_t sweet_fb_flip_w, sweet_fb_flip_h;
++extern "C" void sweet_flip_pool_init(uint32_t size);     /* SweetSurface.cpp */
+ #define MDP_PA          0x0ae00000ULL
+ #define MDP_SIZE        0x30000
+ #define SSPP0           0x5000u
+@@ -305,6 +306,9 @@
+ 			sweet_panel_bpr = bpr;
+ 			sweet_fb_flip_w = fLogicalW;
+ 			sweet_fb_flip_h = fLogicalH;
++			/* iOS's screen surfaces : rows of 64-byte multiples, plus slack for the layout's rounding */
++			sweet_flip_pool_init((uint32_t)round_page((uint64_t)((fLogicalW * 4u + 63u) & ~63u) * fLogicalH) +
++			    4u * (uint32_t)page_size);
+ 		} else {
+ 			OSSafeReleaseNULL(own);
+ 		}
+diff --color -ruN a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+--- a/iokit/Kernel/arm/SweetSurface.cpp	2026-11-15 18:37:31
++++ b/iokit/Kernel/arm/SweetSurface.cpp	2026-11-15 18:37:58
+@@ -80,9 +80,72 @@
+ 
+ OSDefineMetaClassAndStructors(SweetSurface, OSObject);
+ 
++/*
++ * Tab S6 Lite : pool of screen-size buffers, physically contiguous below 4 GiB, allocated once
++ * when AppleCLCD starts (memory is still unfragmented). Measured on the tablet : flipping worked
++ * on the first boot, then every frame was copied (flip=0) : later 12 MiB contiguous allocations
++ * failed. Screen-size surfaces take a free pool buffer first.
++ */
++#define SWEET_FLIP_POOL 4
++static IOBufferMemoryDescriptor *sweet_flip_pool[SWEET_FLIP_POOL];
++static uint64_t sweet_flip_pool_phys[SWEET_FLIP_POOL];
++static bool sweet_flip_pool_used[SWEET_FLIP_POOL];
++static uint32_t sweet_flip_pool_size;
++
++extern "C" void
++sweet_flip_pool_init(uint32_t size)
++{
++	unsigned got = 0;
++	sweet_flip_pool_size = size;
++	for (unsigned i = 0; i < SWEET_FLIP_POOL; i++) {
++		IOBufferMemoryDescriptor *m = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
++		    kIODirectionInOut | kIOMemoryPhysicallyContiguous, size, 0x00000000fffff000ULL);
++		uint64_t phys = m != NULL ? sweet_surface_contiguous(m, size) : 0;
++		if (phys == 0) {
++			OSSafeReleaseNULL(m);
++			continue;
++		}
++		sweet_flip_pool[i] = m;
++		sweet_flip_pool_phys[i] = phys;
++		got++;
++	}
++	printf("SWEET SURF: flip pool %u x %u KiB reserved\n", got, size >> 10);
++}
++
++/* A free pool buffer of at least size bytes (retained, marked used), or NULL. */
++static IOBufferMemoryDescriptor *
++sweet_flip_pool_take(uint32_t size, uint64_t *phys)
++{
++	IOBufferMemoryDescriptor *m = NULL;
++	IOLockLock(sweet_surface_lock);
++	for (unsigned i = 0; i < SWEET_FLIP_POOL && m == NULL; i++) {
++		if (sweet_flip_pool[i] != NULL && !sweet_flip_pool_used[i] && size <= sweet_flip_pool_size) {
++			sweet_flip_pool_used[i] = true;
++			m = sweet_flip_pool[i];
++			m->retain();
++			*phys = sweet_flip_pool_phys[i];
++		}
++	}
++	IOLockUnlock(sweet_surface_lock);
++	return m;
++}
++
++static void
++sweet_flip_pool_give(IOMemoryDescriptor *m)
++{
++	IOLockLock(sweet_surface_lock);
++	for (unsigned i = 0; i < SWEET_FLIP_POOL; i++) {
++		if (m != NULL && m == sweet_flip_pool[i]) {
++			sweet_flip_pool_used[i] = false;
++		}
++	}
++	IOLockUnlock(sweet_surface_lock);
++}
++
+ void
+ SweetSurface::free()
+ {
++	sweet_flip_pool_give(memory);
+ 	if (OSDynamicCast(IOBufferMemoryDescriptor, memory) != NULL) {
+ 		OSAddAtomic64(-(SInt64)allocSize, (volatile SInt64 *)&sweet_surface_wired);
+ 	}
+@@ -711,10 +774,15 @@
+ 			 */
+ 			if (sweet_fb_flip_w != 0 && s->width == sweet_fb_flip_w && s->height == sweet_fb_flip_h &&
+ 			    s->bytesPerElement == 4) {
+-				/* not kIOMemoryKernelUserShared : that allocator ignores the contiguous request (seen on the tablet) */
+-				mem = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+-				    kIODirectionInOut | kIOMemoryPhysicallyContiguous, s->allocSize, 0x00000000fffff000ULL);
+-				s->flipPhys = mem != NULL ? sweet_surface_contiguous(mem, s->allocSize) : 0;
++				uint64_t pphys = 0;
++				mem = sweet_flip_pool_take(s->allocSize, &pphys);
++				s->flipPhys = pphys;
++				if (mem == NULL) {
++					/* not kIOMemoryKernelUserShared : that allocator ignores the contiguous request (seen on the tablet) */
++					mem = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
++					    kIODirectionInOut | kIOMemoryPhysicallyContiguous, s->allocSize, 0x00000000fffff000ULL);
++					s->flipPhys = mem != NULL ? sweet_surface_contiguous(mem, s->allocSize) : 0;
++				}
+ 				/* relevé 0105 : aucune image montrée directement (flip=0) ; on note pourquoi */
+ 				printf("SWEET SURF: screen-size surface %ux%u contiguous alloc %s, phys 0x%llx\n", s->width,
+ 				    s->height, mem != NULL ? "ok" : "FAILED", s->flipPhys);
