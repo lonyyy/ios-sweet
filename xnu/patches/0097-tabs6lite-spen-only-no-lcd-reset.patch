@@ -1,0 +1,107 @@
+diff --color -ruN a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+--- a/bsd/dev/sweet_touch.c	2026-11-15 12:51:06
++++ b/bsd/dev/sweet_touch.c	2026-11-15 12:51:06
+@@ -715,7 +715,7 @@
+ 	}
+ }
+ 
+-static int
++__attribute__((unused)) static int
+ touch_synaptics(void)
+ {
+ 	uint8_t code = 0;
+@@ -747,7 +747,7 @@
+ }
+ 
+ /* After reset: the identify report, then the sensor size and the report program. */
+-static bool
++__attribute__((unused)) static bool
+ syna_start(void)
+ {
+ 	uint8_t code = 0;
+@@ -984,67 +984,41 @@
+ 	if (!touch_clocks() || !touch_se_init()) {
+ 		goto out;
+ 	}
+-	printf("SWEET TOUCH: TLMM reset=%#x irq=%#x; voting L7C (avdd, shared with the S Pen) through RPMh\n",
+-	    touch_rd(st.gpio, TOUCH_GPIO_IO(8)), touch_rd(st.gpio, TOUCH_GPIO_IO(9)));
+-	/* Keep the IC in reset while its rails settle; IRQ stays an input. */
+-	touch_gpio(9, 0, 3, 3, false, false); /* IRQ input, 8 mA, pull-up */
+-	touch_gpio(8, 0, 3, 3, true, false);
+-	/* DT: avdd = pm6150l L7C "wacom_avdd" 3.3 V; vdd = pm6150 L10A 1.8 V, left on by the boot loader. */
++	/*
++	 * Tab S6 Lite : the finger digitizer is the panel's own Himax HX83102E (TDDI) on SPI (SE6 at
++	 * 0xa80000, Android log : "himax_tp spi1.0", irq GPIO 9, reset GPIO 32), not the Synaptics node
++	 * the reference DT kept on this bus. GPIO 8 is the LCD reset (regulator "lcd_rst") : pulling it
++	 * blanked the panel on the tablet. Neither GPIO 8 nor 9 is touched ; this bus only has the S Pen.
++	 */
++	printf("SWEET SPEN: TLMM cfg sda=%#x scl=%#x irq=%#x; voting L7C (wacom_avdd 3.3 V) through RPMh\n",
++	    touch_rd(st.gpio, TOUCH_GPIO_CFG(TOUCH_SDA_GPIO)), touch_rd(st.gpio, TOUCH_GPIO_CFG(TOUCH_SCL_GPIO)),
++	    touch_rd(st.gpio, TOUCH_GPIO_CFG(SPEN_IRQ_GPIO)));
+ 	int power_error = sweet_rpmh_vreg_enable("ldoc7", 3300);
+ 	if (power_error) {
+-		printf("SWEET TOUCH: L7C RPMh enable failed %d; probes skipped\n", power_error);
++		printf("SWEET SPEN: L7C RPMh enable failed %d; stopping\n", power_error);
+ 		goto out;
+ 	}
+-	touch_wait(10); /* conservative rail settling; not a DT timing value */
++	touch_wait(100);
+ 	if (st.bitbang) {
+ 		touch_bb_drive(NULL, 0, false);
+ 		touch_bb_drive(NULL, 1, false);
+ 		touch_wait(2);
+ 		unsigned sda = touch_bb_sense(NULL, 0), scl = touch_bb_sense(NULL, 1);
+-		printf("SWEET TOUCH: bit-bang bus idle sda=%u scl=%u recover=%d\n", sda, scl, i2c_gpio_recover(&touch_bb));
++		printf("SWEET SPEN: bit-bang bus idle sda=%u scl=%u recover=%d\n", sda, scl, i2c_gpio_recover(&touch_bb));
+ 	} else {
+ 		touch_gpio(59, 1, 0, 0, false, false); /* qupv3_se7_i2c SDA/SCL (atoll "qup10", mux 1), 2 mA */
+ 		touch_gpio(60, 1, 0, 0, false, false);
+ 	}
+-	/* Vendor GT9896 dev_confirm: reset low 2 ms, then high. */
+-	touch_gpio(8, 0, 3, 3, true, false);
+-	touch_wait(2);
+-	touch_gpio(8, 0, 3, 3, true, true);
+-	touch_wait(300); /* exceeds vendor 5 ms test + 95 ms post-test wait */
+-	st.probing = true;
+-	bool syna_ok = syna_start();
+-	st.probing = false;
+-	if (st.dead || !syna_ok) {
+-		printf("SWEET TOUCH: Synaptics TCM not started (dead=%d); stopping\n", st.dead);
+-		goto out;
+-	}
+-	st.kind = TOUCH_SYNA;
+ 	touch_gpio(SPEN_IRQ_GPIO, 0, 3, 3, false, false); /* pen IRQ input, pull-up */
++	st.probing = true;
+ 	bool spen_ok = spen_start();
+-	printf("SWEET TOUCH: selected Synaptics TCM, panel 1200x2000, poll=10ms irq-hint=%d\n", st.irq_hint);
+-	unsigned errors = 0, ticks = 0;
+-	while (!st.dead) {
+-		/* Optional IRQ hint still reads every 100ms, and always while down. */
+-		if (!st.irq_hint || st.active || !(touch_rd(st.gpio, TOUCH_GPIO_IO(9)) & 1u) ||
+-		    (++ticks % 10u) == 0) {
+-			if (spen_ok) {
+-				spen_poll();
+-			}
+-			int err = touch_synaptics();
+-			if (err) {
+-				if ((errors++ % 100u) == 0) {
+-					printf("SWEET TOUCH: report err=%d irq=%#x\n", err, st.irq_status);
+-				}
+-				if (errors == 10) {
+-					touch_report(0, st.x, st.y); /* release after persistent bad reads */
+-				}
+-			} else {
+-				errors = 0;
+-			}
+-		}
++	st.probing = false;
++	printf("SWEET SPEN: %s, irq line=%u\n", spen_ok ? "started, polling every 10 ms" : "not started; stopping",
++	    touch_rd(st.gpio, TOUCH_GPIO_IO(SPEN_IRQ_GPIO)) & 1u);
++	while (spen_ok && !st.dead) {
++		spen_poll();
+ 		touch_wait(10);
+ 	}
+-	touch_report(0, st.x, st.y);
+ out:
+ 	(void)thread_terminate(current_thread());
+ 	thread_block(THREAD_CONTINUE_NULL);
