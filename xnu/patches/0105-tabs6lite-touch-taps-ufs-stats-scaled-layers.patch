@@ -1,0 +1,132 @@
+diff --color -ruN a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+--- a/bsd/dev/sweet_touch.c	2026-11-15 15:52:28
++++ b/bsd/dev/sweet_touch.c	2026-11-15 15:52:52
+@@ -1076,6 +1076,7 @@
+  * « SWEET STAT » : images reçues/montrées, copies, temps passé à copier, lectures tactiles.
+  */
+ extern uint64_t sweet_fb_stat[6];                      /* iokit/Kernel/arm/SweetFramebuffer.cpp */
++extern uint64_t sweet_ufs_stat[3];                      /* bsd/dev/sweet_ufs.c */
+ extern unsigned int real_ncpus;
+ extern processor_t cpu_to_processor(int cpu);           /* osfmk : signatures de xnu-8796 */
+ extern processor_t thread_bind(processor_t processor);
+@@ -1110,15 +1111,19 @@
+ 	unsigned period = (unsigned)(uintptr_t)arg;
+ 	touch_wait(30000);
+ 	stat_cpus();
+-	uint64_t fb[6] = { 0 }, hx[4] = { 0 };
++	uint64_t fb[6] = { 0 }, hx[4] = { 0 }, ufs[3] = { 0 };
+ 	for (;;) {
+ 		touch_wait(period * 1000u);
+ 		uint64_t f[6], h[4];
+ 		for (unsigned i = 0; i < 6; i++) f[i] = sweet_fb_stat[i] - fb[i], fb[i] = sweet_fb_stat[i];
+ 		for (unsigned i = 0; i < 4; i++) h[i] = hx_stat[i] - hx[i], hx[i] = hx_stat[i];
++		uint64_t u[3];
++		for (unsigned i = 0; i < 3; i++) u[i] = sweet_ufs_stat[i] - ufs[i], ufs[i] = sweet_ufs_stat[i];
+ 		printf("SWEET STAT: %us swaps=%llu shown=%llu flip=%llu copy=%llu multi=%llu present_ms=%llu"
+ 		    " | hx edges=%llu reads=%llu fingers=%llu read_ms=%llu\n", period, f[0], f[1], f[2], f[3], f[5],
+ 		    stat_us(f[4]) / 1000u, h[0], h[1], h[2], stat_us(h[3]) / 1000u);
++		printf("SWEET STAT: %us ufs cmds=%llu MB=%llu busy_ms=%llu\n", period, u[0], u[1] >> 20,
++		    stat_us(u[2]) / 1000u);
+ 	}
+ }
+ 
+diff --color -ruN a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+--- a/bsd/dev/sweet_ufs.c	2026-11-15 15:52:28
++++ b/bsd/dev/sweet_ufs.c	2026-11-15 15:52:52
+@@ -146,7 +146,7 @@
+  * (to the device when write is set). Returns 0 or an errno.
+  */
+ static int
+-ufs_scsi(const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write)
++ufs_scsi_run(const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write)
+ {
+ 	struct utrd *utrd = (struct utrd *)(su.dma + DMA_UTRL);
+ 	struct ucd *ucd = (struct ucd *)(su.dma + DMA_UCD);
+@@ -256,7 +256,23 @@
+ 	return 0;
+ }
+ 
++extern uint64_t sweet_ufs_stat[3];
++
++static int
++ufs_scsi(const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write)
++{
++	uint64_t t0 = mach_absolute_time();
++	int error = ufs_scsi_run(cdb, cdb_len, len, write);
++	sweet_ufs_stat[0]++;
++	sweet_ufs_stat[1] += len;
++	sweet_ufs_stat[2] += mach_absolute_time() - t0;
++	return error;
++}
++
+ /* READ(10) of count device blocks at lba into the bounce buffer. */
++/* Tab S6 Lite : commandes, octets et temps passé dans ufs_scsi (ligne « SWEET STAT »). */
++uint64_t sweet_ufs_stat[3];
++
+ static int
+ ufs_read_blocks(uint64_t lba, uint32_t count)
+ {
+diff --color -ruN a/bsd/dev/tabs6lite_himax.c b/bsd/dev/tabs6lite_himax.c
+--- a/bsd/dev/tabs6lite_himax.c	2026-11-15 15:52:28
++++ b/bsd/dev/tabs6lite_himax.c	2026-11-15 15:52:52
+@@ -37,9 +37,7 @@
+ 		in = (uint8_t)(in << 1 | (touch_gpio_level(hx_miso) ? 1u : 0u));
+ 		hx_set(HX_CLK, false);
+ 		hx_set(hx_mosi, (out >> b) & 1u);
+-		delay(1);
+-		hx_set(HX_CLK, true);
+-		delay(1);
++		hx_set(HX_CLK, true);   /* chaque écriture TLMM prend déjà ~0,2 µs : < 3 MHz, la puce accepte 7 MHz */
+ 	}
+ 	return in;
+ }
+@@ -167,7 +165,7 @@
+ 		    (mask & 1u) ? hx_pt[0].y : -1);
+ 	}
+ 	if (n < 0) {
+-		mask = 0;
++		return;         /* pile vide (0xFF) : rien de neuf, pas « plus de doigt » (lever un doigt posé cassait les taps) */
+ 	}
+ 	int x[TOUCH_MAX], y[TOUCH_MAX];
+ 	mask &= (1u << SPEN_SLOT) - 1u;
+diff --color -ruN a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp	2026-11-15 15:52:28
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp	2026-11-15 15:52:52
+@@ -561,6 +561,37 @@
+ 		}
+ 		uintptr_t src = s->kernelAddress();
+ 		uint32_t bpe = s->bytesPerElement ? s->bytesPerElement : 4;
++		/*
++		 * Tab S6 Lite : a layer whose source rectangle (a) differs in size from its destination
++		 * (b) is scaled, nearest pixel. Copied 1:1 it read past its rows (sheared stripes seen on
++		 * the tablet) or showed only a corner.
++		 */
++		int32_t aw = (int32_t)get32(a, 8), ah = (int32_t)get32(a, 12);
++		if (src != 0 && bpe == 4 && aw > 0 && ah > 0 && w > 0 && h > 0 && (aw != w || ah != h) &&
++		    sx >= 0 && sy >= 0 && sx + aw <= (int32_t)s->width && sy + ah <= (int32_t)s->height &&
++		    s->elementWidth == 1 && s->elementHeight == 1 && s->memory != NULL &&
++		    (uint64_t)s->offset + (uint64_t)(sy + ah - 1) * s->bytesPerRow + (uint64_t)(sx + aw) * 4 <=
++		    s->memory->getLength()) {
++			int32_t ox = dx - fOffX, oy = dy - fOffY;
++			sweet_fb_stat[3]++;
++			for (int32_t y = 0; y < h; y++) {
++				int32_t py = oy + y;
++				if (py < 0 || py >= (int32_t)fHeight) {
++					continue;
++				}
++				const uint32_t *srow = (const uint32_t *)(src + s->offset +
++				    (uint64_t)(sy + (int64_t)y * ah / h) * s->bytesPerRow) + sx;
++				uint32_t *drow = (uint32_t *)(fPixels + (uint64_t)py * fRowBytes);
++				for (int32_t x = 0; x < w; x++) {
++					int32_t px = ox + x;
++					if (px >= 0 && px < (int32_t)fWidth) {
++						drow[px] = srow[(int64_t)x * aw / w];
++					}
++				}
++			}
++			s->release();
++			continue;
++		}
+ 		if (w <= 0 || h <= 0) {
+ 			w = (int32_t)s->width;
+ 			h = (int32_t)s->height;
