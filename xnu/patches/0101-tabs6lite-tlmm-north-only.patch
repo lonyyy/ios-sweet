@@ -1,0 +1,58 @@
+diff --color -ruN a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+--- a/bsd/dev/sweet_touch.c	2026-11-15 13:44:04
++++ b/bsd/dev/sweet_touch.c	2026-11-15 13:44:12
+@@ -122,37 +122,15 @@
+ }
+ 
+ /*
+- * Tab S6 Lite (atoll) : the TLMM has three register tiles (WEST, NORTH, SOUTH at +0x100000,
+- * +0x500000, +0x900000) and a pin exists in one of them only. The tile of a pin is found by
+- * flipping its pull-down bit in each and reading it back (restored at once) ; NORTH when none answers.
++ * Tab S6 Lite (atoll = sc7180 layout) : every pin this file drives (6, 7, 8, 9, 32, 59-62, 66, 67)
++ * is in the NORTH tile (Linux pinctrl-sc7180.c PINGROUP tiles). Probing the other tiles by writing
++ * at the same offset reset the SoC on the tablet (no panic in the log) : no probing any more.
+  */
+-#define TOUCH_TILES     3u
+-#define TOUCH_PINS      128u
+-static const uint32_t touch_tile_pa[TOUCH_TILES] = { 0x03500000u, TOUCH_NORTH_PA, 0x03d00000u };
+-static vm_offset_t touch_tiles[TOUCH_TILES], touch_pin_tile[TOUCH_PINS];
+-
+ static vm_offset_t
+ touch_tile(unsigned pin)
+ {
+-	if (touch_pin_tile[pin] == 0) {
+-		touch_pin_tile[pin] = st.gpio;
+-		for (unsigned t = 0; t < TOUCH_TILES; t++) {
+-			vm_offset_t base = touch_tiles[t];
+-			if (base == 0) {
+-				continue;
+-			}
+-			uint32_t old = touch_rd(base, TOUCH_GPIO_CFG(pin));
+-			touch_wr(base, TOUCH_GPIO_CFG(pin), old ^ 1u);
+-			bool answers = touch_rd(base, TOUCH_GPIO_CFG(pin)) == (old ^ 1u);
+-			touch_wr(base, TOUCH_GPIO_CFG(pin), old);
+-			if (answers) {
+-				touch_pin_tile[pin] = base;
+-				printf("SWEET TOUCH: gpio%u is in TLMM tile %u (cfg %#x)\n", pin, t, old);
+-				break;
+-			}
+-		}
+-	}
+-	return touch_pin_tile[pin];
++	(void)pin;
++	return st.gpio;
+ }
+ 
+ static void
+@@ -1020,10 +998,7 @@
+ 	touch_wait(delay_s * 1000u);
+ 	printf("SWEET TOUCH: mapping GCC/TLMM/SE7\n");
+ 	st.gcc = ml_io_map(TOUCH_GCC_PA, 0x60000);
+-	for (unsigned t = 0; t < TOUCH_TILES; t++) {
+-		touch_tiles[t] = ml_io_map(touch_tile_pa[t], TOUCH_PINS * 0x1000u);
+-	}
+-	st.gpio = touch_tiles[1];
++	st.gpio = ml_io_map(TOUCH_NORTH_PA, 0x5b000);
+ 	st.se = ml_io_map(TOUCH_SE_PA, 0x4000);
+ 	if (!st.gcc || !st.gpio || !st.se) {
+ 		printf("SWEET TOUCH: MMIO mapping failed\n");
