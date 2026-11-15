@@ -64,11 +64,14 @@ def launchd(root):
         if '_PanicOnCrash' in job:
             job['_PanicOnCrasX'] = job.pop('_PanicOnCrash')
             renamed += 1
-    removed = [k for k, j in jobs.items() if j.get('Label') == 'com.apple.CommCenter']
+    # Tab S6 Lite : bluetoothd (pas de puce Bluetooth Apple) et fairplayd.A2 (pas de matériel FairPlay)
+    # plantent et sont relancés sans fin (des centaines de fois au journal) : retirés aussi.
+    gone = ('com.apple.CommCenter', 'com.apple.bluetoothd', 'com.apple.fairplayd.A2')
+    removed = [k for k, j in jobs.items() if j.get('Label') in gone]
     for k in removed:
         del jobs[k]
     save(path, plist, st.st_uid, st.st_gid, st.st_mode & 0o7777)
-    print(f'launchd.plist: {renamed} _PanicOnCrash renamed, {len(removed)} CommCenter jobs removed')
+    print(f'launchd.plist: {renamed} _PanicOnCrash renamed, {len(removed)} jobs removed (CommCenter, bluetoothd, fairplayd)')
 
 
 def containers(root):
@@ -122,6 +125,21 @@ def audio(root):
         print('StartRecorderServer off', os.path.relpath(conf, root))
 
 
+def staged_apps(root):
+    """Tab S6 Lite : les applis système « supprimables » (Notes, Freeform, Fichiers, Calendrier...)
+    sont livrées dans /private/var/staged_system_apps et installées au premier démarrage ; cette
+    installation n'aboutit pas ici (icônes « Waiting... »). Placées dans /Applications, elles sont
+    enregistrées comme les autres applis système."""
+    src = os.path.join(root, 'private/var/staged_system_apps')
+    moved = []
+    for app in sorted(glob.glob(os.path.join(src, '*.app'))):
+        dst = os.path.join(root, 'Applications', os.path.basename(app))
+        if not os.path.exists(dst):
+            os.rename(app, dst)
+            moved.append(os.path.basename(app))
+    print('staged apps -> /Applications:', ', '.join(moved) or 'aucune')
+
+
 def main():
     if len(sys.argv) != 2 or not os.path.isdir(os.path.join(sys.argv[1], 'System/Library/xpc')):
         sys.exit(__doc__)
@@ -130,6 +148,7 @@ def main():
     containers(root)
     activation(root)
     audio(root)
+    staged_apps(root)
     merge_pref(root, 'com.apple.migration', {
         'LastSystemVersion': BUILD,
         'DMUserDataDisposition': {'SyntheticDidUpgrade': False, 'buildVersion': BUILD}})
