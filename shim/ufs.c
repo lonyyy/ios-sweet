@@ -347,7 +347,12 @@ void show_sweetlog(void)
 	/* Tout l'anneau, ligne par ligne : on ne garde que les lignes des pilotes de la tablette. */
 	enum { KEEP = 56, LEN = 64 };
 	static char keep[KEEP][LEN + 1], line[256];
-#ifdef SHOW_SWEETLOG_PROC
+#ifdef SHOW_SWEETLOG_SB
+	/* variante « interface » : SpringBoard, migration de données, plantages et sorties seulement */
+	static const char tags[][16] = { "SpringBoard", "backboardd", "datamigrat", "igrationplugin", "CRASH ", "exited --", "panic" };
+	static const char skip[][16] = { "xpcproxy", "bluetoothd", "fairplayd" };
+#define SWEETLOG_SKIP 1
+#elif defined(SHOW_SWEETLOG_PROC)
 	/* variante « processus » : lancements, plantages et sorties (qui bloque le démarrage) */
 	static const char tags[][16] = { "exec ", "CRASH ", "exited --", "exit reason", "panic" };
 	/* relancés en boucle sans conséquence sur l'interface (relevé iPadOS) : masqués */
