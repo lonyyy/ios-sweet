@@ -1,0 +1,71 @@
+diff --color -ruN a/bsd/dev/tabs6lite_himax.c b/bsd/dev/tabs6lite_himax.c
+--- a/bsd/dev/tabs6lite_himax.c	2026-11-15 17:42:49
++++ b/bsd/dev/tabs6lite_himax.c	2026-11-15 17:42:49
+@@ -37,9 +37,7 @@
+ 		in = (uint8_t)(in << 1 | (touch_gpio_level(hx_miso) ? 1u : 0u));
+ 		hx_set(HX_CLK, false);
+ 		hx_set(hx_mosi, (out >> b) & 1u);
+-		delay(1);               /* 0105 sans attente : tactile muet sur la tablette ; on revient au rythme validé */
+-		hx_set(HX_CLK, true);
+-		delay(1);
++		hx_set(HX_CLK, true);   /* sans attente : 1,8 ms par trame mesurés sur la tablette (0105), lectures justes */
+ 	}
+ 	return in;
+ }
+@@ -141,18 +139,39 @@
+ 	return ok;
+ }
+ 
+-/* Une trame si l'IRQ est basse ; remonte les doigts 0 à 8 (le 9e emplacement est celui du S Pen). */
++/*
++ * Une trame à chaque impulsion d'IRQ ; remonte les doigts 0 à 8 (le 9e emplacement est au S Pen).
++ * Relevé sur la tablette (0105) : relue sans impulsion, la pile rend la DERNIÈRE trame, doigt
++ * compris : la lecture de secours toutes les 250 ms tenait un doigt fantôme appuyé (appui long
++ * sur l'écran verrouillé = éditeur de fond d'écran, tactile « mort »). Plus de lecture sans
++ * impulsion ; tant qu'un doigt est posé la puce en envoie une à chaque balayage (~60-120 Hz),
++ * donc 80 ms sans impulsion = doigts levés.
++ */
++#define HX_LIFT_POLLS 8u
++
+ static void
+ hx_poll(void)
+ {
+-	static unsigned logged, ticks, edges;
++	static unsigned logged, quiet, edges;
+ 	uint8_t ev[HIMAX_EVENT_LEN];
+ 	bool irq = hx_irq_seen();
+ 	edges += irq;
+ 	hx_stat[0] += irq;
+-	/* sans front, une lecture toutes les 250 ms quand même : la pile dit si la puce balaie */
++	uint32_t fingers = st.active & ((1u << SPEN_SLOT) - 1u);
++	if (!irq) {
++		if (fingers && ++quiet >= HX_LIFT_POLLS) {
++			int x[TOUCH_MAX], y[TOUCH_MAX];
++			for (unsigned i = 0; i < TOUCH_MAX; i++) {
++				x[i] = st.x[i];
++				y[i] = st.y[i];
++			}
++			touch_report(st.active & (1u << SPEN_SLOT), x, y);   /* lève les doigts, garde le stylet */
++		}
++		return;
++	}
++	quiet = 0;
+ 	uint64_t t0 = mach_absolute_time();
+-	if ((!irq && (++ticks % 25u) != 0) || himax_read_event(&hx_io, ev)) {
++	if (himax_read_event(&hx_io, ev)) {
+ 		return;
+ 	}
+ 	hx_stat[1]++;
+diff --color -ruN a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+--- a/iokit/Kernel/arm/SweetSurface.cpp	2026-11-15 17:43:04
++++ b/iokit/Kernel/arm/SweetSurface.cpp	2026-11-15 17:43:04
+@@ -715,6 +715,9 @@
+ 				mem = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+ 				    kIODirectionInOut | kIOMemoryPhysicallyContiguous, s->allocSize, 0x00000000fffff000ULL);
+ 				s->flipPhys = mem != NULL ? sweet_surface_contiguous(mem, s->allocSize) : 0;
++				/* relevé 0105 : aucune image montrée directement (flip=0) ; on note pourquoi */
++				printf("SWEET SURF: screen-size surface %ux%u contiguous alloc %s, phys 0x%llx\n", s->width,
++				    s->height, mem != NULL ? "ok" : "FAILED", s->flipPhys);
+ 			}
+ 			if (mem == NULL) {
+ 				mem = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
