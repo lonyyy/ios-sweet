@@ -1,0 +1,183 @@
+diff --color -ruN a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+--- a/bsd/dev/sweet_touch.c	2026-11-15 15:47:52
++++ b/bsd/dev/sweet_touch.c	2026-11-15 15:49:06
+@@ -1069,6 +1069,70 @@
+ 	thread_block(THREAD_CONTINUE_NULL);
+ }
+ 
++/*
++ * Tab S6 Lite : diagnostics (boot-arg sweetstat=N, secondes ; 0 = coupé, 10 par défaut).
++ * Au démarrage, la vitesse de chaque cœur (boucle de 2 instructions, ~1 tour par cycle :
++ * une estimation de la fréquence, pas une mesure exacte), puis toutes les N s une ligne
++ * « SWEET STAT » : images reçues/montrées, copies, temps passé à copier, lectures tactiles.
++ */
++extern uint64_t sweet_fb_stat[6];                      /* iokit/Kernel/arm/SweetFramebuffer.cpp */
++extern unsigned int real_ncpus;
++extern processor_t cpu_to_processor(int cpu);           /* osfmk : signatures de xnu-8796 */
++extern processor_t thread_bind(processor_t processor);
++
++static uint64_t
++stat_us(uint64_t abs)
++{
++	uint64_t ns;
++	absolutetime_to_nanoseconds(abs, &ns);
++	return ns / 1000u;
++}
++
++static void
++stat_cpus(void)
++{
++	for (unsigned c = 0; c < real_ncpus && c < 8; c++) {
++		(void)thread_bind(cpu_to_processor((int)c));
++		thread_block(THREAD_CONTINUE_NULL);             /* migre sur le cœur c */
++		uint64_t n = 50000000u, t0 = mach_absolute_time();
++		__asm__ volatile("1: subs %0, %0, #1\n b.ne 1b" : "+r"(n) :: "cc");
++		uint64_t us = stat_us(mach_absolute_time() - t0);
++		printf("SWEET CPU: core %u ~%llu MHz (50M tours en %llu us)\n", c, us ? 50000000ull / us : 0, us);
++	}
++	(void)thread_bind((processor_t)0);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static void
++stat_thread(void *arg, wait_result_t result)
++{
++	(void)result;
++	unsigned period = (unsigned)(uintptr_t)arg;
++	touch_wait(30000);
++	stat_cpus();
++	uint64_t fb[6] = { 0 }, hx[4] = { 0 };
++	for (;;) {
++		touch_wait(period * 1000u);
++		uint64_t f[6], h[4];
++		for (unsigned i = 0; i < 6; i++) f[i] = sweet_fb_stat[i] - fb[i], fb[i] = sweet_fb_stat[i];
++		for (unsigned i = 0; i < 4; i++) h[i] = hx_stat[i] - hx[i], hx[i] = hx_stat[i];
++		printf("SWEET STAT: %us swaps=%llu shown=%llu flip=%llu copy=%llu multi=%llu present_ms=%llu"
++		    " | hx edges=%llu reads=%llu fingers=%llu read_ms=%llu\n", period, f[0], f[1], f[2], f[3], f[5],
++		    stat_us(f[4]) / 1000u, h[0], h[1], h[2], stat_us(h[3]) / 1000u);
++	}
++}
++
++static void
++stat_init(void)
++{
++	unsigned period = 10;
++	thread_t t;
++	(void)PE_parse_boot_argn("sweetstat", &period, sizeof(period));
++	if (period && kernel_thread_start(stat_thread, (void *)(uintptr_t)period, &t) == KERN_SUCCESS) {
++		thread_deallocate(t);
++	}
++}
++
+ /* Bluetooth de la Tab S6 Lite (boot-arg tabs6lite_bt=1) : réutilise le GENI et le RPMh de ce fichier. */
+ #include "tabs6lite_bt.c"
+ 
+@@ -1076,6 +1140,7 @@
+ sweet_touch_init(void)
+ {
+ 	tabs6lite_bt_init();
++	stat_init();
+ 	int enabled = 1;
+ 	thread_t thread;
+ 	if (st.started) {
+diff --color -ruN a/bsd/dev/tabs6lite_himax.c b/bsd/dev/tabs6lite_himax.c
+--- a/bsd/dev/tabs6lite_himax.c	2026-11-15 15:47:52
++++ b/bsd/dev/tabs6lite_himax.c	2026-11-15 15:48:36
+@@ -14,6 +14,8 @@
+ #define HX_RST   32u
+ 
+ static unsigned hx_miso = 59u, hx_mosi = 60u;
++/* compteurs du « SWEET STAT » : fronts d'IRQ, trames lues, trames avec doigts, temps de lecture (mach) */
++static uint64_t hx_stat[4];
+ static struct himax_point hx_pt[HIMAX_MAX_PT];
+ 
+ static inline void
+@@ -147,13 +149,18 @@
+ 	uint8_t ev[HIMAX_EVENT_LEN];
+ 	bool irq = hx_irq_seen();
+ 	edges += irq;
++	hx_stat[0] += irq;
+ 	/* sans front, une lecture toutes les 250 ms quand même : la pile dit si la puce balaie */
++	uint64_t t0 = mach_absolute_time();
+ 	if ((!irq && (++ticks % 25u) != 0) || himax_read_event(&hx_io, ev)) {
+ 		return;
+ 	}
++	hx_stat[1]++;
++	hx_stat[3] += mach_absolute_time() - t0;
+ 	unsigned mask;
+ 	int n = himax_parse(ev, hx_pt, &mask);
+-	if (logged < 12 && (n > 0 || logged < 4)) {
++	hx_stat[2] += n > 0;
++	if (logged < 40 && (n > 0 || logged < 4)) {
+ 		logged++;
+ 		printf("SWEET TOUCH: himax event irq=%d edges=%u n=%d mask=%#x %02x%02x%02x%02x cnt=%#x x0=%d y0=%d\n",
+ 		    irq, edges, n, mask, ev[0], ev[1], ev[2], ev[3], ev[52], (mask & 1u) ? hx_pt[0].x : -1,
+diff --color -ruN a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp	2026-11-15 15:47:51
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp	2026-11-15 15:48:36
+@@ -207,6 +207,7 @@
+ 	void removeClient(IOMobileFramebufferUserClient *client);
+ 	void swap(const uint8_t *rec);
+ 	void present(const uint8_t *rec);
++	void present_layers(const uint8_t *rec);
+ };
+ 
+ OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
+@@ -441,6 +442,13 @@
+ 
+ static uint32_t sweet_fb_swaps_logged;
+ static uint64_t sweet_fb_swap_count;
++/*
++ * Tab S6 Lite : counters for the periodic "SWEET STAT" line (bsd/dev/sweet_touch.c) :
++ * 0 swaps from backboardd, 1 frames presented, 2 of them by flipping, 3 layers copied,
++ * 4 mach time spent in present(), 5 frames with more than one layer.
++ */
++extern "C" uint64_t sweet_fb_stat[6];
++uint64_t sweet_fb_stat[6];
+ 
+ /* Copy each enabled layer's surface into the panel memory (no scaling). */
+ /*
+@@ -456,6 +464,7 @@
+ 	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
+ 	fDirty = true;
+ 	IOLockUnlock(fLock);
++	sweet_fb_stat[0]++;
+ 	if ((++sweet_fb_swap_count % 1000) == 0) {
+ 		IOLog("SWEET FB: %llu swaps\n", sweet_fb_swap_count);
+ 	}
+@@ -464,7 +473,19 @@
+ void
+ AppleCLCD::present(const uint8_t *rec)
+ {
++	uint64_t t0 = mach_absolute_time();
++	sweet_fb_stat[1]++;
++	present_layers(rec);
++	sweet_fb_stat[4] += mach_absolute_time() - t0;
++}
++
++void
++AppleCLCD::present_layers(const uint8_t *rec)
++{
+ 	uint32_t mask = get32(rec, 0x104);
++	if (__builtin_popcount(mask & 0xfu) > 1) {
++		sweet_fb_stat[5]++;
++	}
+ 
+ 
+ 	if (!fConsolePaused) {
+@@ -495,6 +516,7 @@
+ 		}
+ 		if (phys != 0) {
+ 			mdp_show(phys, s->bytesPerRow);
++			sweet_fb_stat[2]++;
+ 			SweetSurface *old = sweet_shown;
+ 			sweet_shown = s;                /* keep it while it is scanned out */
+ 			if (old != NULL) {
+@@ -581,6 +603,7 @@
+ 			src = 0;
+ 		}
+ 		if (src != 0 && bpe == 4) {
++			sweet_fb_stat[3]++;
+ 			for (int32_t y = 0; y < h; y++) {
+ 				memcpy((void *)(fPixels + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
+ 				    (const void *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4),
