@@ -1,0 +1,76 @@
+diff --color -ruN a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+--- a/bsd/dev/sweet_touch.c	2026-11-15 14:15:59
++++ b/bsd/dev/sweet_touch.c	2026-11-15 14:16:27
+@@ -864,13 +864,23 @@
+ 	if (!err) {
+ 		err = touch_msg(SPEN_ADDR, NULL, 0, a, sizeof(a), false);
+ 	}
++	/*
++	 * Tab S6 Lite : the maxima are at the start of the answer. Android log of this tablet :
++	 * "F, 58, 20, 34, E0, F, FF, 40, 5, 45, 3, ..." -> max_x 22560, max_y 13536, pressure 4095,
++	 * fw 45034005 (bytes 1-2, 3-4, 5-6, 7-10). Reading them at 17-24 gave 0xFFFF.
++	 */
+ 	if (!err) {
+-		spen.max_x = ((unsigned)a[17] << 8) | a[18];
+-		spen.max_y = ((unsigned)a[19] << 8) | a[20];
+-		spen.max_pressure = ((unsigned)a[21] << 8) | a[22];
++		spen.max_x = ((unsigned)a[1] << 8) | a[2];
++		spen.max_y = ((unsigned)a[3] << 8) | a[4];
++		spen.max_pressure = ((unsigned)a[5] << 8) | a[6];
+ 	}
+-	printf("SWEET SPEN: query err=%d max=%ux%u pressure=%u fw=%02x%02x\n",
+-	    err, spen.max_x, spen.max_y, spen.max_pressure, err ? 0 : a[23], err ? 0 : a[24]);
++	printf("SWEET SPEN: query err=%d max=%ux%u pressure=%u fw=%02x%02x%02x%02x head=%02x\n",
++	    err, spen.max_x, spen.max_y, spen.max_pressure, a[9], a[10], a[7], a[8], a[0]);
++	if (spen.max_x == 0xffffu || spen.max_y == 0xffffu) {
++		spen.max_x = 22560u;            /* the values Android read on this tablet */
++		spen.max_y = 13536u;
++		spen.max_pressure = 4095u;
++	}
+ 	return !err && spen.max_x && spen.max_y;
+ }
+ 
+@@ -881,12 +891,18 @@
+ 		return;                 /* interrupt line high: nothing new (active low) */
+ 	}
+ 	uint8_t d[SPEN_PACKET];
+-	int x, y;
+-	unsigned pressure;
++	int x = 0, y = 0;
++	unsigned pressure = 0;
+ 	if (touch_msg(SPEN_ADDR, NULL, 0, d, sizeof(d), false)) {
+ 		return;
+ 	}
+ 	int down = spen_decode(d, &spen, &x, &y, &pressure);
++	static unsigned logged;
++	if (logged < 8) {
++		logged++;
++		printf("SWEET SPEN: packet %02x %02x%02x %02x%02x %02x%02x -> down=%d x=%d y=%d p=%u\n", d[0], d[1], d[2],
++		    d[3], d[4], d[5], d[6], down, x, y, pressure);
++	}
+ 	if (down < 0) {
+ 		return;
+ 	}
+diff --color -ruN a/bsd/dev/tabs6lite_himax.c b/bsd/dev/tabs6lite_himax.c
+--- a/bsd/dev/tabs6lite_himax.c	2026-11-15 14:15:59
++++ b/bsd/dev/tabs6lite_himax.c	2026-11-15 14:16:18
+@@ -26,12 +26,17 @@
+ hx_byte(uint8_t out)
+ {
+ 	uint8_t in = 0;
+-	for (int b = 7; b >= 0; b--) {          /* mode 3 : sortie sur le front descendant, lecture au montant */
++	/*
++	 * Mode 3. MISO est lu juste avant chaque front descendant : la puce présente son bit dès la fin
++	 * du précédent. Lu au front montant, chaque octet arrivait décalé d'un bit (relevé sur la
++	 * tablette : 0x06215c00 pour l'identité 0x83102e00, soit chaque octet << 1 + le bit suivant).
++	 */
++	for (int b = 7; b >= 0; b--) {
++		in = (uint8_t)(in << 1 | (touch_gpio_level(hx_miso) ? 1u : 0u));
+ 		hx_set(HX_CLK, false);
+ 		hx_set(hx_mosi, (out >> b) & 1u);
+ 		delay(1);
+ 		hx_set(HX_CLK, true);
+-		in = (uint8_t)(in << 1 | (touch_gpio_level(hx_miso) ? 1u : 0u));
+ 		delay(1);
+ 	}
+ 	return in;
