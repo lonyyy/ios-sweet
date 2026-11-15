@@ -1,0 +1,155 @@
+diff --color -ruN a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+--- a/bsd/dev/sweet_touch.c	2026-11-15 13:18:13
++++ b/bsd/dev/sweet_touch.c	2026-11-15 13:18:13
+@@ -121,22 +121,63 @@
+ 	return false;
+ }
+ 
++/*
++ * Tab S6 Lite (atoll) : the TLMM has three register tiles (WEST, NORTH, SOUTH at +0x100000,
++ * +0x500000, +0x900000) and a pin exists in one of them only. The tile of a pin is found by
++ * flipping its pull-down bit in each and reading it back (restored at once) ; NORTH when none answers.
++ */
++#define TOUCH_TILES     3u
++#define TOUCH_PINS      128u
++static const uint32_t touch_tile_pa[TOUCH_TILES] = { 0x03500000u, TOUCH_NORTH_PA, 0x03d00000u };
++static vm_offset_t touch_tiles[TOUCH_TILES], touch_pin_tile[TOUCH_PINS];
++
++static vm_offset_t
++touch_tile(unsigned pin)
++{
++	if (touch_pin_tile[pin] == 0) {
++		touch_pin_tile[pin] = st.gpio;
++		for (unsigned t = 0; t < TOUCH_TILES; t++) {
++			vm_offset_t base = touch_tiles[t];
++			if (base == 0) {
++				continue;
++			}
++			uint32_t old = touch_rd(base, TOUCH_GPIO_CFG(pin));
++			touch_wr(base, TOUCH_GPIO_CFG(pin), old ^ 1u);
++			bool answers = touch_rd(base, TOUCH_GPIO_CFG(pin)) == (old ^ 1u);
++			touch_wr(base, TOUCH_GPIO_CFG(pin), old);
++			if (answers) {
++				touch_pin_tile[pin] = base;
++				printf("SWEET TOUCH: gpio%u is in TLMM tile %u (cfg %#x)\n", pin, t, old);
++				break;
++			}
++		}
++	}
++	return touch_pin_tile[pin];
++}
++
+ static void
+ touch_gpio(unsigned pin, unsigned mux, unsigned pull, unsigned drive, bool out, bool high)
+ {
++	vm_offset_t tile = touch_tile(pin);
+ 	uint32_t off = TOUCH_GPIO_CFG(pin);
+-	uint32_t cfg = touch_rd(st.gpio, off);
++	uint32_t cfg = touch_rd(tile, off);
+ 	if (out) {
+ 		/* Set the desired latch before enabling output (reset is active low). */
+-		touch_wr(st.gpio, TOUCH_GPIO_IO(pin),
+-		    (touch_rd(st.gpio, TOUCH_GPIO_IO(pin)) & ~2u) | (high ? 2u : 0u));
++		touch_wr(tile, TOUCH_GPIO_IO(pin),
++		    (touch_rd(tile, TOUCH_GPIO_IO(pin)) & ~2u) | (high ? 2u : 0u));
+ 	}
+ 	cfg &= ~0x3ffu;
+ 	cfg |= (mux << 2) | pull | (drive << 6) | (out ? 0x200u : 0u);
+-	touch_wr(st.gpio, off, cfg);
++	touch_wr(tile, off, cfg);
+ }
+ 
+ static bool
++touch_gpio_level(unsigned pin)
++{
++	return touch_rd(touch_tile(pin), TOUCH_GPIO_IO(pin)) & 1u;
++}
++
++static bool
+ touch_clocks(void)
+ {
+ 	/* Vote on only wrapper1 and SE7, preserving other clock users. */
+@@ -303,13 +344,13 @@
+  * GPI DMA driver. The two bus pins are driven as open-drain GPIOs instead (input + pull-up = released,
+  * output low = pulled).
+  */
+-#define TOUCH_SDA_GPIO  59u
+-#define TOUCH_SCL_GPIO  60u
++#define TOUCH_SDA_GPIO  6u         /* DT qupv3_se7_i2c_active : pins gpio6, gpio7 (function qup11) */
++#define TOUCH_SCL_GPIO  7u
+ #include "tabs6lite_i2c_gpio.c"
+ 
+ static unsigned touch_bb_pin(unsigned line) { return line ? TOUCH_SCL_GPIO : TOUCH_SDA_GPIO; }
+ static void touch_bb_drive(void *ctx, unsigned line, bool low) { (void)ctx; touch_gpio(touch_bb_pin(line), 0, 3, 3, low, false); }
+-static bool touch_bb_sense(void *ctx, unsigned line) { (void)ctx; return touch_rd(st.gpio, TOUCH_GPIO_IO(touch_bb_pin(line))) & 1u; }
++static bool touch_bb_sense(void *ctx, unsigned line) { (void)ctx; return touch_gpio_level(touch_bb_pin(line)); }
+ static void touch_bb_delay(void *ctx, unsigned us) { (void)ctx; delay((int)us); }
+ static const struct i2c_gpio_ops touch_bb = { NULL, touch_bb_drive, touch_bb_sense, touch_bb_delay, 3 };
+ 
+@@ -797,6 +838,7 @@
+  */
+ #define SPEN_ADDR       0x56u
+ #define SPEN_IRQ_GPIO   66u        /* wacom,irq-gpio = <tlmm 0x42> */
++#define SPEN_FWE_GPIO   67u        /* wacom,fwe-gpio = <tlmm 0x43> : high = firmware flash mode */
+ #define SPEN_PACKET     17u
+ #define SPEN_QUERY      0x2au
+ 
+@@ -857,7 +899,7 @@
+ static void
+ spen_poll(void)
+ {
+-	if (touch_rd(st.gpio, TOUCH_GPIO_IO(SPEN_IRQ_GPIO)) & 1u) {
++	if (touch_gpio_level(SPEN_IRQ_GPIO)) {
+ 		return;                 /* interrupt line high: nothing new (active low) */
+ 	}
+ 	uint8_t d[SPEN_PACKET];
+@@ -975,7 +1017,10 @@
+ 	touch_wait(delay_s * 1000u);
+ 	printf("SWEET TOUCH: mapping GCC/TLMM/SE7\n");
+ 	st.gcc = ml_io_map(TOUCH_GCC_PA, 0x60000);
+-	st.gpio = ml_io_map(TOUCH_NORTH_PA, 0x5b000);
++	for (unsigned t = 0; t < TOUCH_TILES; t++) {
++		touch_tiles[t] = ml_io_map(touch_tile_pa[t], TOUCH_PINS * 0x1000u);
++	}
++	st.gpio = touch_tiles[1];
+ 	st.se = ml_io_map(TOUCH_SE_PA, 0x4000);
+ 	if (!st.gcc || !st.gpio || !st.se) {
+ 		printf("SWEET TOUCH: MMIO mapping failed\n");
+@@ -990,15 +1035,14 @@
+ 	 * the reference DT kept on this bus. GPIO 8 is the LCD reset (regulator "lcd_rst") : pulling it
+ 	 * blanked the panel on the tablet. Neither GPIO 8 nor 9 is touched ; this bus only has the S Pen.
+ 	 */
+-	printf("SWEET SPEN: TLMM cfg sda=%#x scl=%#x irq=%#x; voting L7C (wacom_avdd 3.3 V) through RPMh\n",
+-	    touch_rd(st.gpio, TOUCH_GPIO_CFG(TOUCH_SDA_GPIO)), touch_rd(st.gpio, TOUCH_GPIO_CFG(TOUCH_SCL_GPIO)),
+-	    touch_rd(st.gpio, TOUCH_GPIO_CFG(SPEN_IRQ_GPIO)));
++	/* Android log : "wacom_compulsory_flash_mode : enable(0) fwe(0)", then avdd on, query 200 ms later. */
++	touch_gpio(SPEN_FWE_GPIO, 0, 0, 0, true, false);
+ 	int power_error = sweet_rpmh_vreg_enable("ldoc7", 3300);
+ 	if (power_error) {
+ 		printf("SWEET SPEN: L7C RPMh enable failed %d; stopping\n", power_error);
+ 		goto out;
+ 	}
+-	touch_wait(100);
++	touch_wait(250);
+ 	if (st.bitbang) {
+ 		touch_bb_drive(NULL, 0, false);
+ 		touch_bb_drive(NULL, 1, false);
+@@ -1006,15 +1050,15 @@
+ 		unsigned sda = touch_bb_sense(NULL, 0), scl = touch_bb_sense(NULL, 1);
+ 		printf("SWEET SPEN: bit-bang bus idle sda=%u scl=%u recover=%d\n", sda, scl, i2c_gpio_recover(&touch_bb));
+ 	} else {
+-		touch_gpio(59, 1, 0, 0, false, false); /* qupv3_se7_i2c SDA/SCL (atoll "qup10", mux 1), 2 mA */
+-		touch_gpio(60, 1, 0, 0, false, false);
++		touch_gpio(TOUCH_SDA_GPIO, 1, 0, 0, false, false); /* qupv3_se7_i2c SDA/SCL (atoll "qup11", mux 1), 2 mA */
++		touch_gpio(TOUCH_SCL_GPIO, 1, 0, 0, false, false);
+ 	}
+ 	touch_gpio(SPEN_IRQ_GPIO, 0, 3, 3, false, false); /* pen IRQ input, pull-up */
+ 	st.probing = true;
+ 	bool spen_ok = spen_start();
+ 	st.probing = false;
+ 	printf("SWEET SPEN: %s, irq line=%u\n", spen_ok ? "started, polling every 10 ms" : "not started; stopping",
+-	    touch_rd(st.gpio, TOUCH_GPIO_IO(SPEN_IRQ_GPIO)) & 1u);
++	    touch_gpio_level(SPEN_IRQ_GPIO));
+ 	while (spen_ok && !st.dead) {
+ 		spen_poll();
+ 		touch_wait(10);
