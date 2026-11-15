@@ -2,10 +2,14 @@
 # Copie la racine iPadOS et lui réapplique sweet-root-tweaks.py (applis supprimables dans
 # /Applications, démons en boucle retirés), sans repartir de l'IPSW.
 #
-#   sudo tools/ipados-refresh-root.sh SOURCE.sparseimage SORTIE.sparseimage
+#   sudo tools/ipados-refresh-root.sh SOURCE.sparseimage SORTIE.sparseimage [APPLI.app...]
+#
+# Les APPLI.app données (ex. Croquis, apps/Croquis/build.sh) sont copiées dans /Applications
+# (root:wheel), comme les applis système.
 set -euo pipefail
 [[ $EUID == 0 ]] || { echo "À lancer avec sudo (propriétaires des fichiers iOS à conserver)." >&2; exit 1; }
 src=$1 out=$2
+shift 2
 here=$(cd "$(dirname "$0")" && pwd)
 [[ ! -e $out ]] || { echo "refuse d'écraser $out" >&2; exit 1; }
 cp "$src" "$out"
@@ -13,6 +17,15 @@ mnt=$(mktemp -d /private/tmp/iosroot.XXXXXX)
 hdiutil attach -quiet -nobrowse -owners on -mountpoint "$mnt" "$out"
 trap 'hdiutil detach -quiet "$mnt" 2>/dev/null || true' EXIT
 python3 -I "$here/sweet-root-tweaks.py" "$mnt"
+for app in "$@"; do
+	dst="$mnt/Applications/$(basename "$app")"
+	rm -rf "$dst"
+	ditto --norsrc --noextattr "$app" "$dst"
+	chown -R 0:0 "$dst"
+	chmod -R u=rwX,go=rX "$dst"
+	chmod 0755 "$dst/$(/usr/libexec/PlistBuddy -c 'Print CFBundleExecutable' "$dst/Info.plist")"
+	echo "app ajoutée : $(basename "$app")"
+done
 rm -rf "$mnt/.fseventsd" "$mnt/.Spotlight-V100" "$mnt/.Trashes"
 hdiutil detach -quiet "$mnt"; trap - EXIT
 dev=$(hdiutil attach -nomount -nobrowse "$out" | awk 'NR==1{print $1}')
